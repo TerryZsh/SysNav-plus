@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import os
+import json
 # if using Apple MPS, fall back to CPU for unsupported ops
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"
@@ -137,6 +138,9 @@ class MappingNode(Node):
 
         self.total_mapping_calls = 0
         self.mapping_over_3s = 0
+        self.objnav_traced_tracks = set()
+        self.objnav_candidate_states = {}
+        self.objnav_cloud_timestamp = None
 
         with open(self.object_file_path, "r") as file:
             self.object_config = yaml.safe_load(file)
@@ -285,6 +289,16 @@ class MappingNode(Node):
     def log_info(self, msg):
         self.get_logger().info(msg)
 
+    def objnav_trace(self, event, **fields):
+        fields.update({
+            'event': event,
+            'timestamp': self.get_clock().now().nanoseconds / 1e9,
+            'steady_time_ns': time.monotonic_ns(),
+        })
+        self.get_logger().info(
+            'OBJNAV_TRACE ' + json.dumps(fields, ensure_ascii=False, separators=(',', ':'))
+        )
+
     def save_worker(self):
         while rclpy.ok():
             try:
@@ -418,6 +432,7 @@ class MappingNode(Node):
             # ================== Infer Masks ==================
             # sam2
             sam2_start = time.time()
+            sam2_start_steady = time.monotonic_ns()
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                 self.mask_predictor.set_image(image)
 
@@ -436,7 +451,9 @@ class MappingNode(Node):
                 else: # no information need to add to map
                     detections_tracked['masks'] = []
                     # return
-            sam2_time = time.time() - sam2_start
+            sam2_finished = time.time()
+            sam2_finished_steady = time.monotonic_ns()
+            sam2_time = sam2_finished - sam2_start
 
             annotate_start = time.time()
             if self.ANNOTATE:
@@ -527,10 +544,133 @@ class MappingNode(Node):
 
             # ================== Update the map ==================
 
+            target_indices = [
+                index for index, label in enumerate(det_labels)
+                if str(label).strip().lower() == self.target_object
+            ]
+            tracks_before_update = {
+                int(track_id): next(
+                    (obj for obj in self.obj_mapper.single_obj_list if int(track_id) in obj.obj_id),
+                    None,
+                )
+                for track_id in (detections_tracked['ids'][index] for index in target_indices)
+            }
+
             map_update_start = time.time()
+            map_update_start_steady = time.monotonic_ns()
             if not self.demo_frozen:
                 self.obj_mapper.update_map(detections_tracked, detection_stamp, camera_odom, neighboring_cloud, image, viewpoint_stamp_to_process)
-            map_update_time = time.time() - map_update_start
+            projection_finished = time.time()
+            projection_finished_steady = time.monotonic_ns()
+            map_update_time = projection_finished - map_update_start
+
+            for index in target_indices:
+                track_id = int(detections_tracked['ids'][index])
+                if track_id in self.objnav_traced_tracks:
+                    continue
+
+                mapped_object = next(
+                    (obj for obj in self.obj_mapper.single_obj_list if track_id in obj.obj_id),
+                    None,
+                )
+                mask = detections_tracked['masks'][index]
+                centroid = None
+                object_id = None
+                point_count = 0
+                mask_path = None
+                if mapped_object is not None:
+                    object_id = int(mapped_object.obj_id[0])
+                    inferred_centroid = mapped_object.infer_centroid(
+                        diversity_percentile=self.obj_mapper.percentile_thresh,
+                        regularized=True,
+                    )
+                    if inferred_centroid is not None:
+                        centroid = [float(value) for value in inferred_centroid]
+                    point_count = int(mapped_object.retrieve_valid_voxels(
+                        diversity_percentile=self.obj_mapper.percentile_thresh,
+                        regularized=True,
+                    ).shape[0])
+                    if mapped_object.best_image_path:
+                        mask_path = mapped_object.best_image_path.replace('.npy', '_mask.npy')
+
+                trace_common = {
+                    'target_object': self.target_object,
+                    'track_id': track_id,
+                    'object_id': object_id,
+                    'source_frame_timestamp': float(detection_stamp),
+                }
+                self.objnav_trace(
+                    'semantic_projection_ready',
+                    **trace_common,
+                    mask_started_timestamp=float(sam2_start),
+                    mask_completed_timestamp=float(sam2_finished),
+                    projection_started_timestamp=float(map_update_start),
+                    projection_completed_timestamp=float(projection_finished),
+                    mask_start_steady_ns=sam2_start_steady,
+                    mask_completed_steady_ns=sam2_finished_steady,
+                    projection_start_steady_ns=map_update_start_steady,
+                    projection_completed_steady_ns=projection_finished_steady,
+                    mask_path=mask_path,
+                    mask_pixel_count=int(np.count_nonzero(mask)),
+                    input_point_count=int(len(neighboring_cloud)),
+                    point_count=point_count,
+                    centroid=centroid,
+                    projection_valid=mapped_object is not None and point_count > 0,
+                    image_timestamp=float(detection_stamp),
+                    cloud_timestamp=self.objnav_cloud_timestamp,
+                    odom_timestamp=float(detection_stamp),
+                    image_cloud_delta_s=(
+                        float(detection_stamp - self.objnav_cloud_timestamp)
+                        if self.objnav_cloud_timestamp is not None else None
+                    ),
+                    image_odom_delta_s=0.0,
+                    sync_wait_s=None,
+                    robot_pose={
+                        'x': float(camera_odom['position'][0]),
+                        'y': float(camera_odom['position'][1]),
+                        'z': float(camera_odom['position'][2]),
+                        'qx': float(camera_odom['orientation'][0]),
+                        'qy': float(camera_odom['orientation'][1]),
+                        'qz': float(camera_odom['orientation'][2]),
+                        'qw': float(camera_odom['orientation'][3]),
+                    },
+                )
+
+                if mapped_object is None:
+                    action = 'rejected'
+                    reason = 'projection_did_not_create_memory_object'
+                    merged_ids = []
+                elif tracks_before_update[track_id] is not None:
+                    action = 'updated_by_track_id'
+                    reason = None
+                    merged_ids = []
+                elif len(mapped_object.obj_id) > 1:
+                    action = 'merged_by_geometry'
+                    reason = None
+                    merged_ids = [int(value) for value in mapped_object.obj_id]
+                else:
+                    action = 'created'
+                    reason = None
+                    merged_ids = []
+
+                self.objnav_trace(
+                    'object_memory_associated',
+                    **trace_common,
+                    association_timestamp=float(projection_finished),
+                    association_action=action,
+                    dominant_label=(
+                        mapped_object.get_dominant_label() if mapped_object is not None else None
+                    ),
+                    target_candidate=(
+                        mapped_object is not None
+                        and mapped_object.get_dominant_label() == self.target_object
+                    ),
+                    association_distance_m=None,
+                    association_iou=None,
+                    merged_object_ids=merged_ids,
+                    rejection_reason=reason,
+                )
+                self.objnav_traced_tracks.add(track_id)
 
             # ================== Publish the map ==================
             publish_start = time.time()
@@ -541,6 +681,42 @@ class MappingNode(Node):
             publish_time = time.time() - publish_start
         
             target_objs = self.obj_mapper.check_target_objects()
+            selected_object_ids = {int(obj['object_id']) for obj in target_objs}
+            for single_obj in self.obj_mapper.single_obj_list:
+                label = single_obj.get_dominant_label()
+                if label != self.target_object:
+                    continue
+                object_id = int(single_obj.obj_id[0])
+                selected = object_id in selected_object_ids
+                if selected:
+                    reason = 'label_match_not_asked_and_best_image_score_above_500'
+                    event = 'vlm_candidate_selected'
+                elif single_obj.is_asked_vlm:
+                    reason = 'already_asked_vlm'
+                    event = 'vlm_candidate_rejected'
+                elif single_obj.best_image_score <= 500:
+                    reason = 'best_image_score_not_above_500'
+                    event = 'vlm_candidate_rejected'
+                else:
+                    reason = 'candidate_filter_rejected'
+                    event = 'vlm_candidate_rejected'
+                state = (event, reason, round(float(single_obj.best_image_score), 3))
+                if self.objnav_candidate_states.get(object_id) != state:
+                    self.objnav_candidate_states[object_id] = state
+                    self.objnav_trace(
+                        event,
+                        target_object=self.target_object,
+                        track_id=int(single_obj.obj_id[-1]),
+                        object_id=object_id,
+                        dominant_label=label,
+                        decision_timestamp=self.get_clock().now().nanoseconds / 1e9,
+                        selected=selected,
+                        reason=reason,
+                        is_asked_vlm=bool(single_obj.is_asked_vlm),
+                        queue_depth=None,
+                        best_image_score=float(single_obj.best_image_score),
+                        best_image_score_threshold=500.0,
+                    )
             if len(target_objs) > 0:
                 self.get_logger().info(f"Target objects {self.target_object} found: {target_objs}")
                 self.publish_object_type_query(target_objs)
@@ -695,14 +871,17 @@ class MappingNode(Node):
             #         return
 
             neighboring_cloud = []
+            neighboring_cloud_stamps = []
             for i in range(len(self.cloud_stamps)):
                 if self.cloud_stamps[i] >= (detection_stamp - 0.5) and self.cloud_stamps[i] <= (detection_stamp + 0.1):
                     neighboring_cloud.append(self.cloud_stack[i])
+                    neighboring_cloud_stamps.append(self.cloud_stamps[i])
             if len(neighboring_cloud) == 0:
                 self.log_info("⚠️⚠️⚠️⚠️⚠️⚠️No neighboring cloud found. Waiting for cloud...")
                 return
             else:
                 neighboring_cloud = np.concatenate(neighboring_cloud, axis=0)
+                self.objnav_cloud_timestamp = float(max(neighboring_cloud_stamps))
 
         # if self.last_camera_odom is not None:
         #     if np.linalg.norm(self.last_camera_odom['position'] - camera_odom['position']) < 0.05:

@@ -110,18 +110,6 @@ def generate_launch_description():
     }.items()
   )
 
-  start_joy = Node(
-    package='joy', 
-    executable='joy_node',
-    name='ps3_joy',
-    output='screen',
-    parameters=[{
-                'dev': "/dev/input/js0",
-                'deadzone': 0.12,
-                'autorepeat_rate': 0.0,
-  		}]
-  )
-
   start_tare_planner = IncludeLaunchDescription(
     PythonLaunchDescriptionSource(
       [get_package_share_directory('tare_planner'), '/explore_world_sim.launch']),
@@ -189,8 +177,6 @@ def generate_launch_description():
   ld.add_action(start_vehicle_simulator)
   ld.add_action(start_sensor_scan_generation)
   ld.add_action(start_visualization_tools)
-  ld.add_action(start_joy)
-
   ld.add_action(start_keyboard_input)
   ld.add_action(start_detection_node)
   ld.add_action(start_semantic_mapping_node)

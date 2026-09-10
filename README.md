@@ -278,19 +278,12 @@ colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 
 ### VLM API Key
 
-The VLM node supports two providers via the OpenAI-compatible interface. Set **one** of the following:
-
-**Gemini** (default) &mdash; get a key from [Google AI Studio](https://aistudio.google.com/app/api-keys):
-```bash
-export GEMINI_API_KEY="your-api-key-here"
-```
-
-**Qwen (DashScope)** &mdash; get a key from [Alibaba Cloud DashScope](https://dashscope.console.aliyun.com/):
+The VLM node uses Qwen through the mainland China DashScope OpenAI-compatible endpoint. Get a key from [Alibaba Cloud DashScope](https://dashscope.console.aliyun.com/):
 ```bash
 export DASHSCOPE_API_KEY="your-api-key-here"
 ```
 
-If both keys are set, Gemini is used by default; override with `export VLM_PROVIDER=qwen`. Optionally override Qwen model names with `QWEN_MODEL` / `QWEN_MODEL_LITE`. Add the line(s) to `~/.bashrc` so they persist across terminal sessions.
+Optionally override Qwen model names with `QWEN_MODEL` / `QWEN_MODEL_LITE`. Add the line(s) to `~/.bashrc` so they persist across terminal sessions.
 
 ## Simulation Setup
 

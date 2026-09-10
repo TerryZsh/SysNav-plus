@@ -13,6 +13,7 @@ spacy
 clip
 onnx
 tensorrt
+nvidia-modelopt[onnx]>=0.44
 google-generativeai
 supervision
 shapely

@@ -50,9 +50,9 @@ during process teardown and is separate from the runtime merge-index bug.
 
 Evidence is stored locally in:
 
-- `recordings/semantic-merge-fix-episode-20260909-02.objnav.jsonl`
-- `recordings/semantic-merge-fix-episode-20260909-02.metrics.json`
-- `recordings/semantic-merge-fix-episode-20260909-02.visibility.json`
-- `/tmp/sysnav-semantic-merge-fix-episode-20260909-02.debug.log`
+- `recordings/semantic-merge-fix-episode-20260909-02/objnav.jsonl`
+- `recordings/semantic-merge-fix-episode-20260909-02/metrics.json`
+- `recordings/semantic-merge-fix-episode-20260909-02/visibility.json`
+- `recordings/semantic-merge-fix-episode-20260909-02/debug.log`
 
 The episode did not submit the detected toilet to target-object VLM verification and timed out without planner takeover. That is a separate candidate-promotion issue; it is not treated as part of this merge-index fix.

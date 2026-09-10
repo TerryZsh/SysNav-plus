@@ -70,6 +70,7 @@ class VLMNode(Node):
         self.target_object_counter = 0
         self.target_object_spatial_counter = 0
         self.anchor_object_counter = 0
+        self.objnav_queue_times = {}
 
         # Simulation room types
         # self.room_types = ["Living Room", "Bedroom", "Kitchen", "Bathroom", "Balcony", "Garden"]
@@ -347,12 +348,20 @@ class VLMNode(Node):
         self.room_early_stop_1_query_queue.append(msg)
     
     def object_type_query_callback(self, msg: ObjectType):
+        self.objnav_queue_times[('object_type', int(msg.object_id))] = (
+            self.get_clock().now().nanoseconds / 1e9,
+            time.monotonic_ns(),
+        )
         self.object_type_query_queue.append(msg)
     
     def instruction_callback(self, msg: String):
         self.instruction_queue.append(msg.data)
     
     def target_object_query_callback(self, msg: TargetObject):
+        self.objnav_queue_times[('target_confirmation', int(msg.object_id))] = (
+            self.get_clock().now().nanoseconds / 1e9,
+            time.monotonic_ns(),
+        )
         self.target_object_query_queue.append(msg)
 
     def target_object_spatial_query_callback(self, msg: TargetObjectWithSpatial):
@@ -360,6 +369,16 @@ class VLMNode(Node):
     
     def anchor_object_query_callback(self, msg: TargetObject):
         self.anchor_object_query_queue.append(msg)
+
+    def objnav_trace(self, event, **fields):
+        fields.update({
+            'event': event,
+            'timestamp': self.get_clock().now().nanoseconds / 1e9,
+            'steady_time_ns': time.monotonic_ns(),
+        })
+        self.get_logger().info(
+            'OBJNAV_TRACE ' + json.dumps(fields, ensure_ascii=False, separators=(',', ':'))
+        )
 
     def publish_text_overlay(self, text: str, duration: float = 8.0):
         self._last_msg_id += 1
@@ -683,6 +702,24 @@ class VLMNode(Node):
     
     def process_object_type_query(self, msg: ObjectType):
         """Handle target object query and publish answer"""
+        request_id = f'object-type-{int(msg.object_id)}'
+        started_timestamp = self.get_clock().now().nanoseconds / 1e9
+        started_steady = time.monotonic_ns()
+        queued_timestamp, queued_steady = self.objnav_queue_times.pop(
+            ('object_type', int(msg.object_id)),
+            (started_timestamp, started_steady),
+        )
+        self.objnav_trace(
+            'vlm_request_started',
+            request_kind='object_type',
+            request_id=request_id,
+            object_id=int(msg.object_id),
+            dequeued_timestamp=started_timestamp,
+            encoding_started_timestamp=started_timestamp,
+            queue_depth=len(self.object_type_query_queue),
+            queue_wait_s=(started_steady - queued_steady) / 1e9,
+            image_path=msg.img_path,
+        )
         img = np.load(msg.img_path)
         mask_path = msg.img_path.replace('.npy', '_mask.npy')
         if os.path.exists(mask_path):
@@ -697,12 +734,35 @@ class VLMNode(Node):
             cv2.drawContours(img, contours, -1, (0, 255, 0), 2)
         img_jpg = cv2.imencode('.jpg', img)[1]
         img_base64 = base64.b64encode(img_jpg).decode('utf-8')
+        encoded_steady = time.monotonic_ns()
         labels = msg.labels
         class Result(BaseModel):
             reason: str
             label: str
         try:
             # Process the target object query
+            submitted_timestamp = self.get_clock().now().nanoseconds / 1e9
+            submitted_steady = time.monotonic_ns()
+            self.objnav_trace(
+                'vlm_submitted',
+                request_kind='object_type',
+                request_id=request_id,
+                object_id=int(msg.object_id),
+                submitted_timestamp=submitted_timestamp,
+                input={
+                    'prompt': {
+                        'system': self.object_type_query_prompt,
+                        'user': f"Possible labels: {', '.join(self.object_list)}",
+                    },
+                    'candidate_labels': list(msg.labels),
+                    'room_context': None,
+                    'image_path': msg.img_path,
+                },
+                queue_wait_s=(started_steady - queued_steady) / 1e9,
+                encoding_latency_s=(encoded_steady - started_steady) / 1e9,
+                image_size_bytes=int(img_jpg.nbytes),
+                model=self.object_type_vlm_model,
+            )
             completion = self.vlm_model.beta.chat.completions.parse(
                 model=self.object_type_vlm_model,
                 messages=[{
@@ -719,6 +779,8 @@ class VLMNode(Node):
                 response_format=Result,
             )
             answer = completion.choices[0].message.parsed
+            received_timestamp = self.get_clock().now().nanoseconds / 1e9
+            received_steady = time.monotonic_ns()
             # print the answer
             self.get_logger().info(f"Received target object answer: {answer}")
             verified_label = answer.label
@@ -731,6 +793,29 @@ class VLMNode(Node):
             answer_msg.labels = msg.labels
             self.object_type_answer_publisher.publish(answer_msg)
             self.get_logger().info("Published target object answer")
+            self.objnav_trace(
+                'vlm_result',
+                request_kind='object_type',
+                request_id=request_id,
+                object_id=int(msg.object_id),
+                received_timestamp=received_timestamp,
+                output={
+                    'raw_output': str(answer),
+                    'final_label': verified_label.lower(),
+                    'is_target': verified_label.lower() == self.target_object,
+                    'accepted': True,
+                    'reason': answer.reason,
+                },
+                queue_wait_s=(started_steady - queued_steady) / 1e9,
+                api_latency_s=(received_steady - submitted_steady) / 1e9,
+                parse_latency_s=None,
+                http_status=200,
+                retry_count=0,
+                timeout=False,
+                rate_limited=False,
+                model=self.object_type_vlm_model,
+                image_size_bytes=int(img_jpg.nbytes),
+            )
 
             text = f"Object ID: {msg.object_id}\nVerified Label: {verified_label}\nPossible Labels: {', '.join(labels)}"
             # self.publish_text_overlay(text)
@@ -745,6 +830,26 @@ class VLMNode(Node):
                 
         except Exception as e:
             self.get_logger().error(f"Error processing target object query: {e}")
+            self.objnav_trace(
+                'vlm_result',
+                request_kind='object_type',
+                request_id=request_id,
+                object_id=int(msg.object_id),
+                received_timestamp=self.get_clock().now().nanoseconds / 1e9,
+                output={
+                    'raw_output': str(e),
+                    'final_label': None,
+                    'is_target': False,
+                    'accepted': False,
+                    'reason': 'request_failed',
+                },
+                http_status=None,
+                retry_count=0,
+                timeout='timeout' in str(e).lower(),
+                rate_limited='rate' in str(e).lower(),
+                model=self.object_type_vlm_model,
+                error=str(e),
+            )
     
     def process_instruction(self, instruction: str):
         """Process new instruction from keyboard input and decompose it into target object, spatial condition, and attribute condition"""
@@ -754,11 +859,11 @@ class VLMNode(Node):
         
         class Result(BaseModel):
             target_object: str
-            room_condition: str
-            spatial_condition: str
-            attribute_condition: str
-            anchor_object: str
-            attribute_condition_anchor: str
+            room_condition: str = ''
+            spatial_condition: str = ''
+            attribute_condition: str = ''
+            anchor_object: str = ''
+            attribute_condition_anchor: str = ''
         try:
             completion = self.vlm_model.beta.chat.completions.parse(
                 model=self.object_type_vlm_model,
@@ -810,6 +915,27 @@ class VLMNode(Node):
     
     def process_target_object_query(self, msg: TargetObject):
         """Handle target object query and publish answer"""
+        request_id = (
+            f'target-confirmation-{int(msg.object_id)}-'
+            f'{msg.header.stamp.sec}-{msg.header.stamp.nanosec}'
+        )
+        started_timestamp = self.get_clock().now().nanoseconds / 1e9
+        started_steady = time.monotonic_ns()
+        queued_timestamp, queued_steady = self.objnav_queue_times.pop(
+            ('target_confirmation', int(msg.object_id)),
+            (started_timestamp, started_steady),
+        )
+        self.objnav_trace(
+            'vlm_request_started',
+            request_kind='target_confirmation',
+            request_id=request_id,
+            object_id=int(msg.object_id),
+            dequeued_timestamp=started_timestamp,
+            encoding_started_timestamp=started_timestamp,
+            queue_depth=len(self.target_object_query_queue),
+            queue_wait_s=(started_steady - queued_steady) / 1e9,
+            image_path=msg.img_path,
+        )
         img = np.load(msg.img_path)
         mask_path = msg.img_path.replace('.npy', '_mask.npy')
         if os.path.exists(mask_path):
@@ -824,6 +950,7 @@ class VLMNode(Node):
             cv2.drawContours(img, contours, -1, (0, 255, 0), 2)
         img_jpg = cv2.imencode('.jpg', img)[1]
         img_base64 = base64.b64encode(img_jpg).decode('utf-8')
+        encoded_steady = time.monotonic_ns()
 
         object_label = msg.object_label
         room_label = msg.room_label
@@ -839,6 +966,29 @@ class VLMNode(Node):
             is_target: bool
         try:
             # Process the target object query
+            submitted_timestamp = self.get_clock().now().nanoseconds / 1e9
+            submitted_steady = time.monotonic_ns()
+            self.objnav_trace(
+                'vlm_submitted',
+                request_kind='target_confirmation',
+                request_id=request_id,
+                object_id=int(msg.object_id),
+                target_object=self.target_object,
+                submitted_timestamp=submitted_timestamp,
+                input={
+                    'prompt': {
+                        'system': self.target_object_prompt,
+                        'user': [instruction, description],
+                    },
+                    'candidate_labels': [object_label],
+                    'room_context': room_label,
+                    'image_path': msg.img_path,
+                },
+                queue_wait_s=(started_steady - queued_steady) / 1e9,
+                encoding_latency_s=(encoded_steady - started_steady) / 1e9,
+                image_size_bytes=int(img_jpg.nbytes),
+                model=self.object_type_vlm_model,
+            )
             completion = self.vlm_model.beta.chat.completions.parse(
                 model=self.object_type_vlm_model,
                 messages=[{
@@ -856,6 +1006,8 @@ class VLMNode(Node):
                 response_format=Result,
             )
             answer = completion.choices[0].message.parsed
+            received_timestamp = self.get_clock().now().nanoseconds / 1e9
+            received_steady = time.monotonic_ns()
             # print the answer
             self.get_logger().info(f"Received target object answer: {answer}")
             is_target = answer.is_target
@@ -870,6 +1022,29 @@ class VLMNode(Node):
             answer_msg.is_target = is_target
             self.target_object_answer_publisher.publish(answer_msg)
             self.get_logger().info("Published target object answer")
+            self.objnav_trace(
+                'vlm_result',
+                request_kind='target_confirmation',
+                request_id=request_id,
+                object_id=int(msg.object_id),
+                received_timestamp=received_timestamp,
+                output={
+                    'raw_output': str(answer),
+                    'final_label': object_label,
+                    'is_target': bool(is_target),
+                    'accepted': bool(is_target),
+                    'reason': answer.reason,
+                },
+                queue_wait_s=(started_steady - queued_steady) / 1e9,
+                api_latency_s=(received_steady - submitted_steady) / 1e9,
+                parse_latency_s=None,
+                http_status=200,
+                retry_count=0,
+                timeout=False,
+                rate_limited=False,
+                model=self.object_type_vlm_model,
+                image_size_bytes=int(img_jpg.nbytes),
+            )
 
             text = f"Object ID: {msg.object_id}\nObject Label: {object_label}\nRoom Label: {room_label}\nIs Target: {is_target}\nReason: {answer.reason}"
             self.publish_text_overlay(text)
@@ -884,6 +1059,26 @@ class VLMNode(Node):
                 f.write(f"Is Target: {is_target}\nReason: {answer.reason}")
         except Exception as e:
             self.get_logger().error(f"Error processing target object query: {e}")
+            self.objnav_trace(
+                'vlm_result',
+                request_kind='target_confirmation',
+                request_id=request_id,
+                object_id=int(msg.object_id),
+                received_timestamp=self.get_clock().now().nanoseconds / 1e9,
+                output={
+                    'raw_output': str(e),
+                    'final_label': None,
+                    'is_target': False,
+                    'accepted': False,
+                    'reason': 'request_failed',
+                },
+                http_status=None,
+                retry_count=0,
+                timeout='timeout' in str(e).lower(),
+                rate_limited='rate' in str(e).lower(),
+                model=self.object_type_vlm_model,
+                error=str(e),
+            )
     
     def process_target_object_spatial_query(self, msg: TargetObjectWithSpatial):
         """Handle target object with spatial query and publish answer"""

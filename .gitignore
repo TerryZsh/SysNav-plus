@@ -8,6 +8,7 @@ install/
 Doxyfile
 
 # Python
+.venv/
 __pycache__/
 *.egg-info/
 .pytest_cache/
@@ -41,6 +42,8 @@ bagfile_*/
 !readme.txt
 
 # Simulation & runtime output
+/recordings/
+/downloads/
 sim_benchmark_results/
 debug/
 debug_obj/
@@ -49,6 +52,7 @@ output_frames/
 recorded_videos/
 
 # Project-specific
+/config/vlm.env
 src/base_autonomy/vehicle_simulator/mesh/*
 !src/base_autonomy/vehicle_simulator/mesh/unity
 src/base_autonomy/vehicle_simulator/mesh/unity/*

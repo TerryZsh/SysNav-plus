@@ -15,7 +15,7 @@ setup(
         (os.path.join('share', package_name), glob('launch/*.launch')),
         (os.path.join('share', package_name), glob('config/*.yaml')),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'openai>=1.0.0', 'socksio>=1.0.0'],
     zip_safe=True,
     maintainer='haokun_ros',
     maintainer_email='haokunz@andrew.cmu.edu',
