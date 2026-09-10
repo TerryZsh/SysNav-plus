@@ -399,7 +399,7 @@ class ObjMapper():
                     j += 1
                     curr_obj = self.single_obj_list[j-1]
                     target_centroid = curr_obj.infer_centroid(diversity_percentile=self.percentile_thresh, regularized=True)
-                    if target_centroid is None or j - 1 == i:
+                    if target_centroid is None or curr_obj is single_obj:
                         continue
 
                     dist = np.linalg.norm(target_centroid - centroid)
@@ -444,7 +444,6 @@ class ObjMapper():
                         self.publish_deleted_object(target_obj_same, detection_stamp)
                         target_obj_same.cleanup_images(self.save_queue)
                         self.single_obj_list.remove(target_obj_same)
-                        i -= 1
                         del target_obj_same
                     
                 # # whether to perform cross-class merging (keep this)
@@ -771,5 +770,4 @@ class ObjMapper():
                 single_obj.is_asked_vlm = True
                 single_obj.updated = True # force publish after VLM update
                 single_obj.updated_by_vlm = True
-
 
