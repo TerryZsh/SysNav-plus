@@ -25,6 +25,7 @@ import json
 import time
 from collections import deque
 import threading
+import re
 import yaml
 from rclpy.time import Time
 from vlm_node.utils import project_bbox3d
@@ -60,6 +61,7 @@ class VLMNode(Node):
         
         # queues
         self.room_type_query_queue = deque()
+        self.room_type_queries_in_flight = set()
         self.room_navigation_query_queue = deque(maxlen=1)  # only keep the latest query
         self.room_early_stop_1_query_queue = deque()
         self.object_type_query_queue = deque()
@@ -73,14 +75,14 @@ class VLMNode(Node):
         self.objnav_queue_times = {}
 
         # Simulation room types
-        # self.room_types = ["Living Room", "Bedroom", "Kitchen", "Bathroom", "Balcony", "Garden"]
+        self.room_types = ["Living Room", "Bedroom", "Kitchen", "Bathroom", "Balcony", "Garden"]
         # Gates 4th floor room_types
         # self.room_types = ["Classroom", "Office Room", "Computer Lab", "Restroom", "Student Lounge", "Reception", "Corridor"]
         # Gates 5th floor room_types
         # self.room_types = ["Classroom", "Office Room", "Meeting Room", "Computer Lab", "Restroom", "Storage Room", "Copy Room", "Student Lounge", "Reception", "Corridor"]
         # self.room_types = ["Classroom", "Computer Lab", "Restroom", "Student Lounge", "Corridor"]
         # NSH room_types
-        self.room_types = ["Classroom", "Laboratory", "Office Room", "Meeting Room", "Computer Lab", "Restroom", "Storage Room", "Copy Room", "Student Lounge", "Reception", "Corridor"]
+        # self.room_types = ["Classroom", "Laboratory", "Office Room", "Meeting Room", "Computer Lab", "Restroom", "Storage Room", "Copy Room", "Student Lounge", "Reception", "Corridor"]
         # self.room_types = ["Office Room"]
         # CIC room_types
         # self.room_types = ["Office Room", "Meeting Room", "Open Workspace", "Interview Room", "Reception", "Print Room", "Storage Room", "Restroom"]
@@ -464,7 +466,10 @@ class VLMNode(Node):
                 answer = Result(room_type=raw_text)
             # print the answer
             self.get_logger().info(f"Received room type answer: {answer}")
-            room_type = answer.room_type
+            # Some OpenAI-compatible providers include the numbered option in the
+            # value (for example, "1. Bedroom").  Publish the canonical label so
+            # the planner can compare it with the parsed room condition.
+            room_type = re.sub(r'^\s*\d+\s*[.):\-]\s*', '', answer.room_type).strip()
             self.get_logger().info(f"Determined room type: {room_type}")
             # Publish the room type answer
             answer_msg = msg
@@ -486,6 +491,13 @@ class VLMNode(Node):
         
         except Exception as e:
             self.get_logger().error(f"Error processing room type query: {e}")
+
+    def process_room_type_query_guarded(self, room_id, msg):
+        """Keep at most one room-classification API request in flight per room."""
+        try:
+            self.process_room_type_query(msg)
+        finally:
+            self.room_type_queries_in_flight.discard(room_id)
     
     def process_room_navigation_query(self, msg: NavigationQuery):
         """Handle room navigation query(receive a JSON string) and publish answer"""
@@ -1289,8 +1301,15 @@ class VLMNode(Node):
                     latest_queries[room_id] = item
             # using multithreading to process room type queries
             for room_id, query in latest_queries.items():
+                if room_id in self.room_type_queries_in_flight:
+                    continue
+                self.room_type_queries_in_flight.add(room_id)
                 self.get_logger().info(f"Processing room type query for room {room_id}")
-                threading.Thread(target=self.process_room_type_query, args=(query,)).start()
+                threading.Thread(
+                    target=self.process_room_type_query_guarded,
+                    args=(room_id, query),
+                    daemon=True,
+                ).start()
         
         # check if there are any room early stop 1 queries
         if self.room_early_stop_1_query_queue:

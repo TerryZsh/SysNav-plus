@@ -131,6 +131,8 @@ class ObjMapper():
         self.background_obj_list = []
 
         self.valid_cnt = 1
+        self.next_memory_id = 1
+        self.last_associations = {}
 
         self.cloud_image_fusion = cloud_image_fusion
 
@@ -183,6 +185,53 @@ class ObjMapper():
             return True
         else:
             return False
+
+    def allocate_memory_id(self):
+        """Return an episode-local persistent ID independent of tracker IDs."""
+        memory_id = self.next_memory_id
+        self.next_memory_id += 1
+        return memory_id
+
+    @staticmethod
+    def labels_compatible(existing_label, incoming_label):
+        if existing_label == incoming_label:
+            return True
+        return (
+            [existing_label, incoming_label] in MERGE_PRIMITIVE_GROUPS
+            or [incoming_label, existing_label] in MERGE_PRIMITIVE_GROUPS
+        )
+
+    @staticmethod
+    def track_geometry_consistent(single_obj, incoming_points):
+        """Validate that a reused tracker ID still describes the same 3D object."""
+        existing_points = np.asarray(single_obj.voxel_manager.voxels)
+        incoming_points = np.asarray(incoming_points)
+        if existing_points.size == 0 or incoming_points.size == 0:
+            return False, None, None, None
+
+        existing_center = np.median(existing_points[:, :3], axis=0)
+        incoming_center = np.median(incoming_points[:, :3], axis=0)
+        center_distance = float(np.linalg.norm(existing_center - incoming_center))
+
+        existing_min = existing_points[:, :3].min(axis=0)
+        existing_max = existing_points[:, :3].max(axis=0)
+        incoming_min = incoming_points[:, :3].min(axis=0)
+        incoming_max = incoming_points[:, :3].max(axis=0)
+        existing_diagonal = float(np.linalg.norm(existing_max - existing_min))
+        incoming_diagonal = float(np.linalg.norm(incoming_max - incoming_min))
+        distance_threshold = float(np.clip(
+            0.5 * max(existing_diagonal, incoming_diagonal),
+            0.75,
+            2.0,
+        ))
+
+        axis_gap = np.maximum(
+            np.maximum(existing_min - incoming_max, incoming_min - existing_max),
+            0.0,
+        )
+        bbox_gap = float(np.linalg.norm(axis_gap))
+        consistent = center_distance <= distance_threshold and bbox_gap <= 0.35
+        return consistent, center_distance, distance_threshold, bbox_gap
     
     def IoU_3D_Bbox(self, bbox_3d_object, bbox_3d_target, extent_object, extent_target):
         # calculating the 3D IoU
@@ -211,6 +260,7 @@ class ObjMapper():
     # @memory_profiler.profile
     @profile
     def update_map(self, detections, detection_stamp, detection_odom, cloud, image=None, viewpoint_stamp_to_process=None):
+        self.last_associations = {}
         R_b2w = Rotation.from_quat(detection_odom['orientation']).as_matrix()
         t_b2w = np.array(detection_odom['position'])
         R_w2b = R_b2w.T
@@ -271,8 +321,8 @@ class ObjMapper():
                 part1_time += (part1_end - part1_start)
                 continue
             
-            class_id = labels[cloud_cnt]
-            obj_id = obj_ids[cloud_cnt]
+            class_id = str(labels[cloud_cnt])
+            track_id = int(obj_ids[cloud_cnt])
 
             pcd_new = o3d.geometry.PointCloud()
             pcd_new.points = o3d.utility.Vector3dVector(cloud[:, :3])
@@ -289,37 +339,77 @@ class ObjMapper():
             # Match object cloud to existing object based on object id
             merged = False
             
-            if obj_id < 0:
+            if track_id < 0:
                 pass
             else:
+                compatible_matches = []
+                rejected_matches = []
                 for single_obj in self.single_obj_list:
-                    # Add more secure check apart from obj_id appearance
-                    if obj_id in single_obj.obj_id:
-                        single_obj.update(points_np, R_b2w, t_b2w, class_id, detection_stamp, clip_feat=clip_feat, confidence=confidences[cloud_cnt])
-                        single_obj.reproject_obs_angle(R_w2b, t_w2b, masks[cloud_cnt], projection_func=self.cloud_image_fusion.scan2pixels)
-                        single_obj.inactive_frame = -1
-                        # Save masked image if enabled and image is provided
-                        if (self.save_object_image and image is not None and 
+                    if track_id not in single_obj.track_ids:
+                        continue
+                    existing_label = single_obj.get_dominant_label()
+                    class_ok = self.labels_compatible(existing_label, class_id)
+                    geometry_ok, distance, distance_threshold, bbox_gap = (
+                        self.track_geometry_consistent(single_obj, points_np)
+                    )
+                    if class_ok and geometry_ok:
+                        compatible_matches.append((distance, single_obj))
+                    else:
+                        rejected_matches.append({
+                            'memory_id': int(single_obj.obj_id[0]),
+                            'existing_label': existing_label,
+                            'incoming_label': class_id,
+                            'class_compatible': class_ok,
+                            'centroid_distance_m': distance,
+                            'distance_threshold_m': distance_threshold,
+                            'bbox_gap_m': bbox_gap,
+                        })
+
+                if compatible_matches:
+                    matched_distance, single_obj = min(
+                        compatible_matches, key=lambda item: item[0]
+                    )
+                    single_obj.update(
+                        points_np, R_b2w, t_b2w, class_id, detection_stamp,
+                        clip_feat=clip_feat,
+                        confidence=confidences[cloud_cnt],
+                        track_id=track_id,
+                    )
+                    single_obj.reproject_obs_angle(
+                        R_w2b, t_w2b, masks[cloud_cnt],
+                        projection_func=self.cloud_image_fusion.scan2pixels,
+                    )
+                    single_obj.inactive_frame = -1
+                    if (self.save_object_image and image is not None and
                             self.frame_count % self.image_save_interval == 0):
-                            single_obj.save_best_image(
-                                image, 
-                                masks[cloud_cnt],
-                                confidences[cloud_cnt],
-                                self.save_queue
-                            )
-                        merged = True
-                        break
+                        single_obj.save_best_image(
+                            image, masks[cloud_cnt], confidences[cloud_cnt], self.save_queue
+                        )
+                    merged = True
+                    self.last_associations[(track_id, class_id)] = {
+                        'memory_id': int(single_obj.obj_id[0]),
+                        'action': 'updated_by_track_id',
+                        'centroid_distance_m': matched_distance,
+                        'rejection_reason': None,
+                        'track_conflicts': rejected_matches,
+                    }
+                elif rejected_matches:
+                    self.log_info(
+                        f"Track association rejected for track {track_id}: "
+                        f"{rejected_matches}"
+                    )
             part2_end = time.time()
             part2_time += (part2_end - part2_start)
 
             part3_start = time.time()
             if not merged:
-                if obj_id < 0:
-                    self.background_obj_list.append(SingleObject(class_id, obj_id, points_np, \
-                        self.voxel_size, R_b2w, t_b2w, masks[cloud_cnt], detection_stamp, num_angle_bin=self.num_angle_bin,confidence=confidences[cloud_cnt]))
+                if track_id < 0:
+                    self.background_obj_list.append(SingleObject(class_id, track_id, points_np, \
+                        self.voxel_size, R_b2w, t_b2w, masks[cloud_cnt], detection_stamp, num_angle_bin=self.num_angle_bin,confidence=confidences[cloud_cnt], track_id=track_id))
                 else:
-                    new_obj = SingleObject(class_id, obj_id, points_np, \
-                        self.voxel_size, R_b2w, t_b2w, masks[cloud_cnt], detection_stamp, num_angle_bin=self.num_angle_bin,confidence=confidences[cloud_cnt])
+                    memory_id = self.allocate_memory_id()
+                    new_obj = SingleObject(class_id, memory_id, points_np, \
+                        self.voxel_size, R_b2w, t_b2w, masks[cloud_cnt], detection_stamp, num_angle_bin=self.num_angle_bin,confidence=confidences[cloud_cnt], track_id=track_id)
                     # Save initial masked image if enabled
                     if self.save_object_image and image is not None:
                         new_obj.save_best_image(
@@ -329,6 +419,22 @@ class ObjMapper():
                             self.save_queue
                         )
                     self.single_obj_list.append(new_obj)
+                    nearest_conflict_distance = min(
+                        (
+                            item['centroid_distance_m'] for item in rejected_matches
+                            if item['centroid_distance_m'] is not None
+                        ),
+                        default=None,
+                    )
+                    self.last_associations[(track_id, class_id)] = {
+                        'memory_id': memory_id,
+                        'action': 'created',
+                        'centroid_distance_m': nearest_conflict_distance,
+                        'rejection_reason': (
+                            'track_id_reused_or_jump' if rejected_matches else None
+                        ),
+                        'track_conflicts': rejected_matches,
+                    }
             part3_time_end = time.time()
             part3_time += (part3_time_end - part3_start)
         
@@ -747,7 +853,7 @@ class ObjMapper():
         for single_obj in self.single_obj_list:
             class_id_length = len(single_obj.class_id)
             label = single_obj.get_dominant_label()
-            if (label == self.target_object or label == self.anchor_object) and not single_obj.is_asked_vlm and single_obj.best_image_score > 500:
+            if (label == self.target_object or label == self.anchor_object) and not single_obj.is_asked_vlm and single_obj.best_image_score > 300:
                 single_target_obj = {
                     'object_id': single_obj.obj_id[0],
                     'labels': list(single_obj.class_id.keys()),
@@ -770,4 +876,3 @@ class ObjMapper():
                 single_obj.is_asked_vlm = True
                 single_obj.updated = True # force publish after VLM update
                 single_obj.updated_by_vlm = True
-

@@ -138,7 +138,7 @@ class MappingNode(Node):
 
         self.total_mapping_calls = 0
         self.mapping_over_3s = 0
-        self.objnav_traced_tracks = set()
+        self.objnav_traced_associations = set()
         self.objnav_candidate_states = {}
         self.objnav_cloud_timestamp = None
 
@@ -548,14 +548,6 @@ class MappingNode(Node):
                 index for index, label in enumerate(det_labels)
                 if str(label).strip().lower() == self.target_object
             ]
-            tracks_before_update = {
-                int(track_id): next(
-                    (obj for obj in self.obj_mapper.single_obj_list if int(track_id) in obj.obj_id),
-                    None,
-                )
-                for track_id in (detections_tracked['ids'][index] for index in target_indices)
-            }
-
             map_update_start = time.time()
             map_update_start_steady = time.monotonic_ns()
             if not self.demo_frozen:
@@ -566,13 +558,24 @@ class MappingNode(Node):
 
             for index in target_indices:
                 track_id = int(detections_tracked['ids'][index])
-                if track_id in self.objnav_traced_tracks:
+                target_label = str(detections_tracked['labels'][index])
+                association = self.obj_mapper.last_associations.get(
+                    (track_id, target_label), {}
+                )
+                associated_memory_id = association.get('memory_id')
+                trace_key = (track_id, associated_memory_id)
+                if trace_key in self.objnav_traced_associations:
                     continue
 
-                mapped_object = next(
-                    (obj for obj in self.obj_mapper.single_obj_list if track_id in obj.obj_id),
-                    None,
-                )
+                mapped_object = None
+                if associated_memory_id is not None:
+                    mapped_object = next(
+                        (
+                            obj for obj in self.obj_mapper.single_obj_list
+                            if associated_memory_id in obj.obj_id
+                        ),
+                        None,
+                    )
                 mask = detections_tracked['masks'][index]
                 centroid = None
                 object_id = None
@@ -640,9 +643,9 @@ class MappingNode(Node):
                     action = 'rejected'
                     reason = 'projection_did_not_create_memory_object'
                     merged_ids = []
-                elif tracks_before_update[track_id] is not None:
-                    action = 'updated_by_track_id'
-                    reason = None
+                elif association:
+                    action = association['action']
+                    reason = association['rejection_reason']
                     merged_ids = []
                 elif len(mapped_object.obj_id) > 1:
                     action = 'merged_by_geometry'
@@ -665,12 +668,13 @@ class MappingNode(Node):
                         mapped_object is not None
                         and mapped_object.get_dominant_label() == self.target_object
                     ),
-                    association_distance_m=None,
+                    association_distance_m=association.get('centroid_distance_m'),
                     association_iou=None,
                     merged_object_ids=merged_ids,
                     rejection_reason=reason,
+                    track_conflicts=association.get('track_conflicts', []),
                 )
-                self.objnav_traced_tracks.add(track_id)
+                self.objnav_traced_associations.add(trace_key)
 
             # ================== Publish the map ==================
             publish_start = time.time()
@@ -689,13 +693,13 @@ class MappingNode(Node):
                 object_id = int(single_obj.obj_id[0])
                 selected = object_id in selected_object_ids
                 if selected:
-                    reason = 'label_match_not_asked_and_best_image_score_above_500'
+                    reason = 'label_match_not_asked_and_best_image_score_above_300'
                     event = 'vlm_candidate_selected'
                 elif single_obj.is_asked_vlm:
                     reason = 'already_asked_vlm'
                     event = 'vlm_candidate_rejected'
-                elif single_obj.best_image_score <= 500:
-                    reason = 'best_image_score_not_above_500'
+                elif single_obj.best_image_score <= 300:
+                    reason = 'best_image_score_not_above_300'
                     event = 'vlm_candidate_rejected'
                 else:
                     reason = 'candidate_filter_rejected'
@@ -706,7 +710,7 @@ class MappingNode(Node):
                     self.objnav_trace(
                         event,
                         target_object=self.target_object,
-                        track_id=int(single_obj.obj_id[-1]),
+                        track_id=single_obj.last_track_id,
                         object_id=object_id,
                         dominant_label=label,
                         decision_timestamp=self.get_clock().now().nanoseconds / 1e9,
@@ -715,7 +719,7 @@ class MappingNode(Node):
                         is_asked_vlm=bool(single_obj.is_asked_vlm),
                         queue_depth=None,
                         best_image_score=float(single_obj.best_image_score),
-                        best_image_score_threshold=500.0,
+                        best_image_score_threshold=300.0,
                     )
             if len(target_objs) > 0:
                 self.get_logger().info(f"Target objects {self.target_object} found: {target_objs}")

@@ -51,7 +51,7 @@ class VoxelFeatureManager:
         self.remove_vote = np.zeros(num_points, dtype=int)
         
         self.num_angle_bin = num_angle_bin
-    
+
     # @profile
     def update(self, voxels, odom_R, odom_t):
         num_points = voxels.shape[0]
@@ -291,9 +291,17 @@ class VoxelFeatureManager:
         return voxel_indices
 
 class SingleObject:
-    def __init__(self, class_id, obj_id, voxels, voxel_size, odom_R, odom_t, mask, stamp, clip_feat=None, num_angle_bin=15, confidence=1.0, centroid=None):
+    def __init__(self, class_id, memory_id, voxels, voxel_size, odom_R, odom_t, mask, stamp, clip_feat=None, num_angle_bin=15, confidence=1.0, centroid=None, track_id=None):
         self.class_id = {class_id: 1}
-        self.obj_id = [obj_id]
+        # obj_id is the persistent memory identity consumed by the planner.
+        # Tracker identities are short-lived observations and must never be used
+        # as long-term object identities.
+        self.obj_id = [int(memory_id)]
+        self.track_ids = set()
+        self.last_track_id = None
+        if track_id is not None:
+            self.track_ids.add(int(track_id))
+            self.last_track_id = int(track_id)
         self.voxel_manager = VoxelFeatureManager(voxels, voxel_size, odom_R, odom_t, num_angle_bin)
 
          # Add the feature of confidence to the object
@@ -519,7 +527,7 @@ class SingleObject:
         self.key_pose.append(odom_t + [R_to_yaw(odom_R)])
 
     # @profile
-    def update(self, voxels, odom_R, odom_t, label, stamp, clip_feat=None,confidence=1.0):
+    def update(self, voxels, odom_R, odom_t, label, stamp, clip_feat=None, confidence=1.0, track_id=None):
         """
             Merge the new object with the existing one.
             Update the voxel manager, class id, and other attributes.
@@ -528,6 +536,9 @@ class SingleObject:
         self.voxel_manager.update(voxels, odom_R, odom_t)
         self.info_frames_cnt += 1
         self.latest_stamp = stamp
+        if track_id is not None:
+            self.track_ids.add(int(track_id))
+            self.last_track_id = int(track_id)
 
         self.clip_feat = clip_feat * self.fusion_weight + self.clip_feat * (1 - self.fusion_weight) if self.clip_feat is not None else clip_feat
         # check if the new pose is similar to the old poses
@@ -554,6 +565,9 @@ class SingleObject:
     
     def merge_object(self, single_obj):
         self.obj_id.extend(single_obj.obj_id)
+        self.track_ids.update(single_obj.track_ids)
+        if single_obj.last_track_id is not None:
+            self.last_track_id = single_obj.last_track_id
         # self.obj_id.sort() # make the obj_id consistent
 
         self.voxel_manager.update_through_vote_stat(single_obj.voxel_manager)
@@ -942,4 +956,3 @@ def minimum_bounding_rectangle(points):
     except Exception as e:
         print(e)
         return None, None
-    

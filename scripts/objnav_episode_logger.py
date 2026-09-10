@@ -90,11 +90,13 @@ class EpisodeLogger:
         self.args = args
         self.run_dir = args.run_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        (self.run_dir / 'evidence').mkdir()
+        (self.run_dir / 'evidence').mkdir(exist_ok=True)
         self.output = (self.run_dir / 'objnav.jsonl').open('x', buffering=1)
         self.started_steady_ns = time.monotonic_ns()
         self.started_ros = self.ros_now()
-        self.trace_id = f'{self.run_dir.name}/{args.target}-1'
+        self.trace_id = f'{self.run_dir.name}/target-1'
+        self.target_object = None
+        self.target_resolved_timestamp = None
         self.events = []
         self.counts = Counter()
         self.poses = deque(maxlen=12000)
@@ -124,7 +126,8 @@ class EpisodeLogger:
         self.terrain_xy = []
         self.last_terrain_sample = 0.0
         self.semantic_samples = []
-        self.target_colors = self.load_target_colors()
+        self.target_colors = []
+        self.initial_semantic_frames = []
         self.target_instruction_received = False
         self.prompt_attempts = 0
         self.last_prompt_at = None
@@ -160,7 +163,7 @@ class EpisodeLogger:
         self.event(
             'episode_start',
             instruction=args.instruction,
-            target_object=args.target,
+            target_object=None,
             start_pose=start_pose,
             configured_goal_pose=point_pose(args.target_point),
             status='completed',
@@ -213,7 +216,7 @@ class EpisodeLogger:
             return [
                 np.array([int(row['b']), int(row['g']), int(row['r'])], dtype=np.int16)
                 for row in csv.DictReader(stream)
-                if categories.get(row['name']) == self.args.target
+                if categories.get(row['name']) == self.target_object
             ]
 
     def nearest_pose(self, timestamp):
@@ -249,7 +252,11 @@ class EpisodeLogger:
                 pose['x'] - self.last_progress_pose['x'],
                 pose['y'] - self.last_progress_pose['y'],
             ) >= 0.10:
-                if self.first_cmd is not None and not self.motion_started:
+                if (
+                    self.first_cmd is not None
+                    and not self.motion_started
+                    and self.pending_goal['received_steady'] is not None
+                ):
                     self.motion_started = True
                     self.event(
                         'motion_started',
@@ -270,10 +277,15 @@ class EpisodeLogger:
 
     def on_semantic(self, msg):
         self.counts['semantic_image'] += 1
-        if self.target_instruction_received or len(self.semantic_samples) >= 3:
+        if len(self.semantic_samples) >= 3:
             return
         if msg.encoding not in ('bgr8', 'rgb8'):
             return
+        if not self.target_instruction_received:
+            self.initial_semantic_frames.append(msg)
+        self.semantic_samples.append(self.semantic_sample(msg))
+
+    def semantic_sample(self, msg):
         image = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.step)
         image = image[:, :msg.width * 3].reshape(msg.height, msg.width, 3)
         if msg.encoding == 'rgb8':
@@ -283,22 +295,29 @@ class EpisodeLogger:
             int(np.count_nonzero(np.max(np.abs(image16 - color), axis=2) <= 8))
             for color in self.target_colors
         ]
-        self.semantic_samples.append({
+        return {
             'frame_timestamp': stamp_seconds(msg.header.stamp),
             'target_pixels': pixels,
-        })
+        }
 
     def on_instruction(self, msg):
         self.counts['target_instruction'] += 1
-        if msg.target_object.strip().lower() == self.args.target:
-            self.target_instruction_received = True
+        target = msg.target_object.strip().lower()
+        if not target or self.target_instruction_received:
+            return
+        self.target_object = target
+        self.target_resolved_timestamp = self.ros_now()
+        self.target_colors = self.load_target_colors()
+        self.semantic_samples = [self.semantic_sample(frame) for frame in self.initial_semantic_frames]
+        self.initial_semantic_frames.clear()
+        self.target_instruction_received = True
 
     def on_detection(self, msg):
         self.counts['detection_result'] += 1
         if not self.target_instruction_received or self.target_detected:
             return
         for index, label in enumerate(msg.label):
-            if label.strip().lower() != self.args.target:
+            if label.strip().lower() != self.target_object:
                 continue
             self.target_detected = True
             frame_timestamp = stamp_seconds(msg.header.stamp)
@@ -306,7 +325,7 @@ class EpisodeLogger:
             self.event(
                 'yolo_target_detected',
                 timestamp=self.ros_now(),
-                target_object=self.args.target,
+                target_object=self.target_object,
                 track_id=int(msg.track_id[index]),
                 confidence=float(msg.confidence[index]),
                 bbox=[
@@ -343,7 +362,7 @@ class EpisodeLogger:
             record = {
                 'pose': point_pose(obj.position),
                 'label': obj.label,
-                'track_ids': [int(value) for value in obj.object_id],
+                'memory_ids': [int(value) for value in obj.object_id],
                 'image_path': obj.img_path,
                 'bbox3d': [
                     {'x': float(point.x), 'y': float(point.y), 'z': float(point.z)}
@@ -352,8 +371,6 @@ class EpisodeLogger:
             }
             if object_id is not None:
                 self.objects[object_id] = record
-            for track_id in obj.object_id:
-                self.track_to_object[int(track_id)] = object_id
 
     def on_target_answer(self, msg):
         self.counts['target_object_answer'] += 1
@@ -373,7 +390,7 @@ class EpisodeLogger:
             timestamp=stamp_seconds(msg.header.stamp),
             goal_id=goal_id,
             object_id=object_id,
-            target_object=self.args.target,
+            target_object=self.target_object,
             input={
                 'robot_pose': self.last_pose,
                 'target_pose': obj.get('pose'),
@@ -571,12 +588,10 @@ class EpisodeLogger:
                 self.first_pose['x'] - self.args.start_x,
                 self.first_pose['y'] - self.args.start_y,
             )
-        visible = bool(
-            self.semantic_samples
-            and any(self.semantic_samples[0]['target_pixels'])
-        )
+        visible = (bool(any(self.semantic_samples[0]['target_pixels']))
+                   if self.target_instruction_received and self.semantic_samples else None)
         report = {
-            'target_object': self.args.target,
+            'target_object': self.target_object,
             'fixed_start': {
                 'x': self.args.start_x,
                 'y': self.args.start_y,
@@ -587,7 +602,7 @@ class EpisodeLogger:
             'start_xy_error_m': start_error,
             'ground_truth_target_pose': point_pose(self.args.target_point),
             'initial_target_visible': visible,
-            'passed': bool(start_error is not None and start_error <= 0.05 and not visible),
+            'passed': bool(start_error is not None and start_error <= 0.05 and visible is False),
             'semantic_frames': self.semantic_samples,
         }
         (self.run_dir / 'visibility.json').write_text(
@@ -702,6 +717,9 @@ class EpisodeLogger:
             event_times.setdefault(event['event'], event['elapsed_s'])
         metrics = {
             'run_name': self.run_dir.name,
+            'instruction': self.args.instruction,
+            'target_object': self.target_object,
+            'target_resolved_timestamp': self.target_resolved_timestamp,
             'success': self.goal_reached,
             'stop_reason': stop_reason,
             'duration_s': round(self.elapsed(), 3),
@@ -725,7 +743,6 @@ def main():
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--instruction', default='Find a toilet.')
-    parser.add_argument('--target', default='toilet')
     parser.add_argument('--start-x', type=float, default=0.0)
     parser.add_argument('--start-y', type=float, default=0.0)
     parser.add_argument('--start-z', type=float, default=0.75)
@@ -752,8 +769,15 @@ def main():
         logger.stop_reason = 'manual_stop'
         logger.stop_source = 'test_harness'
 
+    def timeout_stop(*_):
+        nonlocal stopped
+        stopped = True
+        logger.stop_reason = 'timeout'
+        logger.stop_source = 'test_harness'
+
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGUSR1, timeout_stop)
     try:
         while rclpy.ok() and not stopped and not logger.done:
             rclpy.spin_once(node, timeout_sec=0.1)

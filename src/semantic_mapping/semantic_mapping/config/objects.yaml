@@ -75,6 +75,10 @@ prompts:
     prompts:
       - bed
     is_instance: true
+  air_conditioner:
+    prompts:
+      - air conditioner
+    is_instance: true
   # wall:
   #   prompts:
   #     - wall

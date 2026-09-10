@@ -66,8 +66,11 @@ class DetectNode(Node):
         print(f"Text prompt: {self.text_prompt}")
 
         self.grounding_model = YOLO(self.CONFIG_DIR / "external/yolov8x-worldv2_cus.engine", task='detect')
-        # self.grounding_model = YOLOE(self.CONFIG_DIR / "external/yoloe-11l-seg.engine", task="segment")
-        self.grounding_model = YOLOE(self.CONFIG_DIR / "external/yoloe-26x-seg.engine", task="segment")
+        # Use the promptable checkpoint so task-specific classes in objects.yaml
+        # are actually available to the detector. TensorRT engines have a fixed
+        # vocabulary baked in at export time.
+        self.grounding_model = YOLOE(self.CONFIG_DIR / "external/yoloe-26x-seg.pt", task="segment")
+        self.grounding_model.set_classes(self.text_prompt_list.tolist())
 
         self.device = device
 

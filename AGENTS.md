@@ -4,6 +4,25 @@
 
 每次运行仿真 episode 都必须记录完整的目标导航闭环。日志用于判断目标在哪一层被发现、处理、确认、接管，以及 episode 最终为什么结束。
 
+## 仿真启动要求
+
+- 每次拉起 simulation 时都必须同时拉起 RViz，包括正式 demo、调试、验证、失败重试和短时检查；不得只启动 ROS/Unity 仿真而不启动 RViz。
+- RViz 必须是仿真启动流程的默认必需组件，不得设计成需要额外传入 `--rviz` 才会启用的可选项。
+- 启动 harness/runner 负责拉起和管理 RViz；logger 只能观察和记录，不得负责启动、停止或控制仿真与 RViz。
+- RViz 必须与该次 simulation 使用相同的 ROS domain、workspace 环境和 episode 生命周期，其原始输出统一写入该 episode 的 `debug.log`。
+- 启动后必须确认 RViz 进程仍在运行。若 RViz 启动失败或提前退出，本次 simulation 启动不完整，不得作为有效 demo；必须在 `metrics.json` 中记录 `rviz_started: false`、`success: false` 和实际失败原因。
+- planner 确认到达目标后，录制必须继续保留 2 秒画面，再由启动 harness/runner 结束 episode；logger 只能记录到达事件，不得触发该计时或停止仿真。
+
+## Demo 画面要求
+
+- `demo.mp4` 必须同时包含三个与本 episode 实时同步的视图：带 YOLO 框和实例 mask 的 panorama、以 RViz 俯瞰图为背景的 object-memory 生长图、Unity 第三人称视角。
+- panorama 必须是面积最大的主视图，并完整保留检测框、类别/track 标注和实例 mask；其余两个视图不得遮挡 panorama 中的关键目标证据。
+- object-memory 生长图必须叠加在 RViz 的真实俯瞰地图、点云或占据区域上，实时展示 memory object 的创建、更新、合并及空间位置；不得使用空白背景，也不得用 episode 结束后的离线路径图或静态截图冒充实时 memory 生长。
+- Unity 视图必须使用能同时看见机器人和周围环境的第三人称相机，不得以第一人称 panorama 或静态 Unity 截图代替。
+- 三个视图必须来自同一次 simulation，使用同一 ROS clock 或保留可验证的时间对应关系；禁止拼接其他 episode、预录素材或不同步的画面。
+- `demo-preview.jpg` 必须从最终 `demo.mp4` 的实际帧中提取，并尽量同时展示上述三个视图和目标检测证据。
+- 任一必需视图缺失、冻结或录制失败时，不得将 demo 标记为有效；必须在 `metrics.json` 中分别记录 `panorama_recorded`、`rviz_memory_view_recorded`、`unity_third_person_recorded` 及失败原因。
+
 ## 每次 episode 必须生成的文件
 
 每个 episode 必须使用独立目录 `recordings/<run-name>/`。该 episode 的日志、图片、视频和中间证据只能放在该目录内，不得与其他 episode 混放：
