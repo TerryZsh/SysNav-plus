@@ -399,11 +399,18 @@ class MappingNode(Node):
 
     def target_object_instruction_callback(self, msg):
         previous_target = self.target_object
+        previous_anchor = self.anchor_object
         self.target_object = msg.target_object
         self.anchor_object = msg.anchor_object
         self.obj_mapper.target_object = msg.target_object
         self.obj_mapper.anchor_object = msg.anchor_object
+        task_changed = (
+            self.target_object != previous_target or
+            self.anchor_object != previous_anchor
+        )
         for single_obj in self.obj_mapper.single_obj_list:
+            if task_changed:
+                single_obj.is_asked_vlm = False
             label = single_obj.get_dominant_label()
             if label == self.target_object or label == previous_target:
                 single_obj.updated = True  # Force re-publish
@@ -723,7 +730,14 @@ class MappingNode(Node):
                     )
             if len(target_objs) > 0:
                 self.get_logger().info(f"Target objects {self.target_object} found: {target_objs}")
-                self.publish_object_type_query(target_objs)
+                # Target candidates are confirmed once with the complete
+                # instruction by the planner's Potential Target flow. Keep
+                # object-type review only for anchor candidates.
+                anchor_objs = [
+                    obj for obj in target_objs
+                    if obj.get('candidate_kind') == 'anchor'
+                ]
+                self.publish_object_type_query(anchor_objs)
 
             total_time = time.time() - start_time
             # self.log_info(f"🚨🚨 Map update time: {map_update_time}, sam2 time: {sam2_time}, annotate time: {annotate_time}, publish time: {publish_time}, total time: {total_time}")

@@ -26,6 +26,17 @@ tare_planner_node:
     kNoExplorationReturnHome : true
     kExtendWayPointDistanceBig : 4.0
     kExtendWayPointDistanceSmall : 1.5
+    # On first observation, approach a Potential Target at normal navigation
+    # speed, then hold at a safe standoff while VLM review is pending.
+    kPotentialTargetApproachTolerance : 0.3
+    kPotentialTargetNoProgressTimeout : 10.0
+    kPotentialTargetProgressThreshold : 0.1
+    kPotentialTargetVlmWaitTimeout : 15.0
+    # Final object-arrival gate for ordinary target routing. Potential Target
+    # observation instead uses the nearest collision-free viewpoint
+    # within 2 m (in XY) of the object-cloud point nearest to the robot.
+    kFoundObjectPathDistanceThreshold : 1.0
+    kFoundObjectEuclideanDistanceThreshold : 2.0
     kKeyposeCloudDwzFilterLeafSize : 0.05
     kRushHomeDist : 3.0
     kRushRoomDist_1 : 4.0
@@ -167,4 +178,3 @@ room_segmentation:
     isDebug: True
     normal_search_num: 20
     normal_search_radius: 0.3
-    

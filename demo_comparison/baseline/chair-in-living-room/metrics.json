@@ -1,0 +1,57 @@
+{
+  "run_name": "baseline-livingroom-chair-20260910-01",
+  "success": true,
+  "stop_reason": "goal_reached",
+  "error": null,
+  "duration_s": 199.529,
+  "event_times_s": {
+    "episode_start": 0.009659,
+    "yolo_target_detected": 8.23895,
+    "semantic_projection_ready": 8.342385,
+    "object_memory_associated": 8.342719,
+    "vlm_candidate_selected": 8.352858,
+    "vlm_request_started": 8.368849,
+    "vlm_submitted": 8.373149,
+    "vlm_result": 10.439599,
+    "vlm_candidate_rejected": 14.30199,
+    "episode_end": 198.980994
+  },
+  "event_counts": {
+    "episode_start": 1,
+    "yolo_target_detected": 1,
+    "semantic_projection_ready": 14,
+    "object_memory_associated": 14,
+    "vlm_candidate_selected": 9,
+    "vlm_request_started": 61,
+    "vlm_submitted": 61,
+    "vlm_result": 61,
+    "vlm_candidate_rejected": 6,
+    "episode_end": 1
+  },
+  "topic_counts": {
+    "state_estimation": 39321,
+    "cmd_vel": 9788,
+    "semantic_image": 645,
+    "detection_result": 457,
+    "object_nodes_list": 397,
+    "target_instruction": 1,
+    "accepted_vlm_results_all_types": 57
+  },
+  "travel_distance_m": 16.637,
+  "demo_recorded": true,
+  "demo_failure_reason": null,
+  "planner_path_generated": true,
+  "instrumentation_limitations": [
+    "Baseline lacks detector completion timestamps and receiver-side planner/controller tracing; unavailable events are not inferred.",
+    "Recorded paths are actual /global_path outputs, with no verified association to a target goal."
+  ],
+  "phase_latency_s": {
+    "observation": null,
+    "final": null
+  },
+  "demo_frames": 1788,
+  "goal_reached": true,
+  "goal_reached_elapsed_s": 28.625956773757935,
+  "validation_source": "evidence/validation.json",
+  "target_confirmation_count": 9
+}

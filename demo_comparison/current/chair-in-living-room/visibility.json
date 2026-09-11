@@ -1,0 +1,89 @@
+{
+  "target_object": "chair",
+  "fixed_start": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.75,
+    "yaw": 0.0
+  },
+  "observed_initial_pose": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.75,
+    "qx": 0.0,
+    "qy": 0.0,
+    "qz": 0.0,
+    "qw": 1.0
+  },
+  "start_xy_error_m": 0.0,
+  "ground_truth_target_pose": {
+    "x": 0.5699537,
+    "y": -3.164187,
+    "z": -0.0003869534,
+    "qx": 0.0,
+    "qy": 0.0,
+    "qz": 0.0,
+    "qw": 1.0
+  },
+  "initial_target_visible": true,
+  "passed": false,
+  "semantic_frames": [
+    {
+      "frame_timestamp": 1789122736.282743,
+      "target_pixels": [
+        0,
+        0,
+        3298,
+        310,
+        0,
+        0,
+        1131,
+        0,
+        664,
+        5,
+        0,
+        0,
+        0,
+        3308
+      ]
+    },
+    {
+      "frame_timestamp": 1789122736.427699,
+      "target_pixels": [
+        0,
+        0,
+        3284,
+        300,
+        0,
+        0,
+        1111,
+        0,
+        693,
+        5,
+        0,
+        0,
+        0,
+        3305
+      ]
+    },
+    {
+      "frame_timestamp": 1789122736.5226555,
+      "target_pixels": [
+        0,
+        0,
+        3307,
+        318,
+        0,
+        0,
+        1081,
+        0,
+        727,
+        4,
+        0,
+        0,
+        0,
+        3295
+      ]
+    }
+  ]
+}

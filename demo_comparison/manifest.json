@@ -1,0 +1,128 @@
+{
+  "comparison_name": "baseline-vs-current-objnav-demos",
+  "created_date": "2026-09-11",
+  "requested_baseline_reference": {
+    "description": "first pushed system version",
+    "candidate_commit": "c21d5ad",
+    "commit_subject": "feat: add objnav episode tracing and adapt simulation setup",
+    "verification": "recording files do not embed a git commit hash"
+  },
+  "common_spawn": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.75,
+    "yaw": 0.0,
+    "all_observed_start_xy_error_m": 0.0
+  },
+  "presentation": {
+    "format": "refined-dashboard-v1",
+    "resolution": "2560x1440",
+    "current": "direct live compositor",
+    "baseline": "offline transform from flattened video and objnav.jsonl",
+    "baseline_missing_stream_policy": "show an explicit unavailable panel; never infer or fabricate pixels"
+  },
+  "pairs": [
+    {
+      "target": "chair",
+      "room": "living room",
+      "spawn_matches": true,
+      "target_category_matches": true,
+      "instruction_matches": true,
+      "exact_target_instance_matches": null,
+      "exact_target_instance_note": "baseline did not preselect or log a ground-truth target pose",
+      "baseline": {
+        "source": "recordings/baseline-livingroom-chair-20260910-01",
+        "copy": "baseline/chair-in-living-room",
+        "instruction": "Find a chair in the living room.",
+        "success": true,
+        "stop_reason": "goal_reached",
+        "duration_s": 199.529,
+        "ground_truth_target_pose": null
+      },
+      "current": {
+                "source": "recordings/unified-target-chair-20260911-02",
+        "copy": "current/chair-in-living-room",
+        "instruction": "Find a chair in the living room.",
+        "success": true,
+        "stop_reason": "goal_reached",
+                "duration_s": 21.696,
+        "ground_truth_target_pose": {
+          "x": 0.5699537,
+          "y": -3.164187,
+          "z": -0.0003869534
+        }
+      }
+    },
+    {
+      "target": "bed",
+      "room": "bedroom",
+      "spawn_matches": true,
+      "target_category_matches": true,
+      "instruction_matches": true,
+      "exact_target_instance_matches": null,
+      "exact_target_instance_note": "baseline did not preselect or log a ground-truth target pose",
+      "baseline": {
+        "source": "recordings/baseline-bedroom-bed-20260910-01",
+        "copy": "baseline/bed-in-bedroom",
+        "instruction": "Find a bed in the bedroom.",
+        "success": false,
+        "stop_reason": "timeout",
+        "duration_s": 300.457,
+        "ground_truth_target_pose": null
+      },
+      "current": {
+                "source": "recordings/unified-target-bed-20260911-02",
+        "copy": "current/bed-in-bedroom",
+        "instruction": "Find a bed in the bedroom.",
+        "success": true,
+        "stop_reason": "goal_reached",
+                "duration_s": 46.338,
+        "ground_truth_target_pose": {
+          "x": 8.0315,
+          "y": -8.686,
+          "z": 0.6530461
+        }
+      }
+    },
+    {
+      "target": "toilet",
+      "room": "bathroom",
+      "spawn_matches": true,
+      "target_category_matches": true,
+      "instruction_matches": false,
+      "instruction_difference": "baseline says 'Find a toilet.'; current explicitly adds 'in the bathroom'",
+      "exact_target_instance_matches": true,
+      "target_pose_delta_m": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.000046134
+      },
+      "baseline": {
+        "source": "recordings/toilet_original_repo_demo",
+        "copy": "baseline/toilet",
+        "instruction": "Find a toilet.",
+        "success": false,
+        "stop_reason": "timeout",
+        "duration_s": 300.016,
+        "ground_truth_target_pose": {
+          "x": 2.9565,
+          "y": -12.301,
+          "z": 0.0
+        }
+      },
+      "current": {
+                "source": "recordings/unified-target-toilet-20260911-04",
+        "copy": "current/toilet",
+        "instruction": "Find a toilet in the bathroom.",
+        "success": true,
+        "stop_reason": "goal_reached",
+                "duration_s": 54.367,
+        "ground_truth_target_pose": {
+          "x": 2.9565,
+          "y": -12.301,
+          "z": 0.000046134
+        }
+      }
+    }
+  ]
+}

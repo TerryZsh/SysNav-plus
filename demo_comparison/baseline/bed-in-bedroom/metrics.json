@@ -1,0 +1,43 @@
+{
+  "run_name": "baseline-bedroom-bed-20260910-01",
+  "success": false,
+  "stop_reason": "timeout",
+  "error": null,
+  "duration_s": 300.457,
+  "event_times_s": {
+    "episode_start": 0.01046,
+    "yolo_target_detected": 21.922694,
+    "semantic_projection_ready": 22.728241,
+    "object_memory_associated": 22.728616,
+    "episode_end": 300.01139
+  },
+  "event_counts": {
+    "episode_start": 1,
+    "yolo_target_detected": 1,
+    "semantic_projection_ready": 12,
+    "object_memory_associated": 12,
+    "episode_end": 1
+  },
+  "topic_counts": {
+    "state_estimation": 59833,
+    "cmd_vel": 14837,
+    "detection_result": 691,
+    "semantic_image": 1020,
+    "object_nodes_list": 561,
+    "target_instruction": 3
+  },
+  "travel_distance_m": 126.385,
+  "demo_recorded": true,
+  "demo_failure_reason": null,
+  "planner_path_generated": true,
+  "instrumentation_limitations": [
+    "Baseline lacks detector completion timestamps and receiver-side planner/controller tracing; unavailable events are not inferred.",
+    "Recorded paths are actual /global_path outputs, with no verified association to a target goal."
+  ],
+  "phase_latency_s": {
+    "observation": null,
+    "final": null
+  },
+  "demo_frames": 2719,
+  "target_confirmation_count": 0
+}

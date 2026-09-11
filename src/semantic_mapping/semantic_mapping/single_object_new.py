@@ -420,7 +420,9 @@ class SingleObject:
             filepath = os.path.join(self.base_image_dir, filename)
             maskpath = os.path.join(self.base_image_dir, maskname)
             
-            self.is_asked_vlm = False  # reset the flag to ask VLM again for the new image
+            # Keep the category-review state when a larger keyframe replaces
+            # the image. The path is stable, so final verification will read
+            # the newest pixels without repeatedly re-running category VLM.
 
             try:
                 # cv2.imwrite(filepath, cropped_img)  # Save masked image directly

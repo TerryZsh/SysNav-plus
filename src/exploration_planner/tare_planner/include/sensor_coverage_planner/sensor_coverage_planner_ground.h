@@ -29,6 +29,7 @@
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/float32.hpp>
+#include <std_msgs/msg/int8.hpp>
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/int32_multi_array.hpp>
@@ -139,6 +140,12 @@ private:
   double kLookAheadDistance;
   double kExtendWayPointDistanceBig;
   double kExtendWayPointDistanceSmall;
+  double kPotentialTargetApproachTolerance;
+  double kPotentialTargetNoProgressTimeout;
+  double kPotentialTargetProgressThreshold;
+  double kPotentialTargetVlmWaitTimeout;
+  double kFoundObjectPathDistanceThreshold;
+  double kFoundObjectEuclideanDistanceThreshold;
 
   // Int
   int kDirectionChangeCounterThr;
@@ -374,6 +381,7 @@ private:
   rclcpp::Publisher<tare_planner::msg::NavigationQuery>::SharedPtr room_navigation_query_pub_;
   rclcpp::Publisher<tare_planner::msg::RoomEarlyStop1>::SharedPtr room_early_stop_1_pub_;
   rclcpp::Publisher<tare_planner::msg::ViewpointRep>::SharedPtr viewpoint_rep_pub_;
+  rclcpp::Publisher<std_msgs::msg::Int8>::SharedPtr potential_target_stop_pub_;
 
   // ========== VLM-Related Functions ==========
   // Viewpoint representation
@@ -438,6 +446,26 @@ private:
   void SetFoundAnchorObject();
   void ProcessObjectNodes();
   void CheckAnchorObjectFound();
+  void StartPotentialTargetApproach(
+      const tare_planner::msg::ObjectNode &object_node);
+  double GetDistanceToObjectFootprint(
+      const geometry_msgs::msg::Point &position,
+      const representation_ns::ObjectNodeRep &object_node) const;
+  bool GetClosestPotentialTargetCloudPoint(
+      const representation_ns::ObjectNodeRep &object_node,
+      const geometry_msgs::msg::Point &reference_position,
+      geometry_msgs::msg::Point &closest_point) const;
+  bool SelectPotentialTargetObservationWaypoint(
+      const representation_ns::ObjectNodeRep &object_node,
+      geometry_msgs::msg::Point &observation_waypoint,
+      double &robot_distance, double &object_surface_distance,
+      bool &is_final_observation_waypoint);
+  void UpdatePotentialTargetApproach();
+  bool RequestPotentialTargetFinalReview();
+  void ConfirmPotentialTargetAtObservation();
+  void SetPotentialTargetHold(bool hold);
+  void StopPotentialTargetApproach(const std::string &reason);
+  void AbandonPotentialTarget(const std::string &reason);
   
   // VLM query functions
   void PublishRoomNavigationQuery();
@@ -542,6 +570,24 @@ private:
   std::vector<int> object_ids_to_remove_;
   double obj_score_;
   std::set<int> considered_object_ids_;
+  enum class PotentialTargetObservationState {
+    IDLE,
+    APPROACHING,
+    OBSERVING,
+  };
+  PotentialTargetObservationState potential_target_observation_state_;
+  int potential_target_approach_object_id_;
+  geometry_msgs::msg::Point potential_target_approach_waypoint_;
+  bool potential_target_waypoint_is_final_;
+  double potential_target_best_waypoint_distance_;
+  rclcpp::Time potential_target_last_progress_at_;
+  rclcpp::Time potential_target_vlm_wait_started_at_;
+  bool potential_target_final_review_requested_;
+  bool potential_target_vlm_result_received_;
+  bool potential_target_vlm_accepted_;
+  bool potential_target_hold_active_;
+  bool potential_target_terminal_confirmed_;
+  std::unordered_set<int> approached_potential_target_ids_;
   
   // Search and navigation conditions
   std::string room_condition_;

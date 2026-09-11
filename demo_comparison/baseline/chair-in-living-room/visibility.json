@@ -1,0 +1,82 @@
+{
+  "target_object": "chair",
+  "fixed_start": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.75,
+    "yaw": 0.0
+  },
+  "observed_initial_pose": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.75,
+    "qx": 0.0,
+    "qy": 0.0,
+    "qz": 0.0,
+    "qw": 1.0
+  },
+  "start_xy_error_m": 0.0,
+  "ground_truth_target_pose": null,
+  "ground_truth_note": "Room-qualified instance is not preselected; determined by baseline VLM",
+  "initial_target_visible": true,
+  "passed": false,
+  "semantic_frames": [
+    {
+      "frame_timestamp": 1789020615.5652187,
+      "target_pixels": [
+        0,
+        0,
+        3301,
+        310,
+        0,
+        0,
+        1131,
+        0,
+        661,
+        5,
+        0,
+        0,
+        0,
+        3306
+      ]
+    },
+    {
+      "frame_timestamp": 1789020615.6352053,
+      "target_pixels": [
+        0,
+        0,
+        3277,
+        307,
+        0,
+        0,
+        1111,
+        0,
+        663,
+        5,
+        0,
+        0,
+        0,
+        3316
+      ]
+    },
+    {
+      "frame_timestamp": 1789020615.950262,
+      "target_pixels": [
+        0,
+        0,
+        3078,
+        319,
+        0,
+        0,
+        885,
+        0,
+        597,
+        1,
+        0,
+        0,
+        44,
+        3350
+      ]
+    }
+  ]
+}

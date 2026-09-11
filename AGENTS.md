@@ -17,11 +17,17 @@
 
 - `demo.mp4` 必须同时包含三个与本 episode 实时同步的视图：带 YOLO 框和实例 mask 的 panorama、以 RViz 俯瞰图为背景的 object-memory 生长图、Unity 第三人称视角。
 - panorama 必须是面积最大的主视图，并完整保留检测框、类别/track 标注和实例 mask；其余两个视图不得遮挡 panorama 中的关键目标证据。
+- `demo.mp4` 必须由专用合成器直接将 panorama、RViz render stream 和 Unity render stream 编码到同一画布；禁止使用整个桌面或显示器的 screen recording 作为最终视频源，最终画面不得包含桌面栏、其他应用窗口或窗口排列产生的空白区域。
+- RViz 必须使用单一、放大的俯瞰 render view，不得因残留 Image dock、工具面板或多个小视窗而缩成缩略图；其视野必须覆盖已探索楼层，以累积方式保留 room/object memory 的新建、更新和合并过程。
+- Unity 作为辅助视图可小于 RViz memory 俯瞰图，但仍必须是连续、实时的第三人称视角。
+- `demo.mp4` 必须包含实时数据面板，至少显示当前 pipeline stage、目标类别、memory object 数量，以及最新一次 VLM 请求的类型、输入和输出；这些内容必须来自当前 episode 的实时 ROS 消息/事件，不得事后伪造。
+- 每收到一次 VLM 输出，视频中都必须立即出现醒目的 `VLM OUTPUT RECEIVED` caption，包含 request kind、object/request ID 和结果摘要；同时返回多个结果时必须逐条排队展示，不得被后一条瞬间覆盖。
 - object-memory 生长图必须叠加在 RViz 的真实俯瞰地图、点云或占据区域上，实时展示 memory object 的创建、更新、合并及空间位置；不得使用空白背景，也不得用 episode 结束后的离线路径图或静态截图冒充实时 memory 生长。
 - Unity 视图必须使用能同时看见机器人和周围环境的第三人称相机，不得以第一人称 panorama 或静态 Unity 截图代替。
 - 三个视图必须来自同一次 simulation，使用同一 ROS clock 或保留可验证的时间对应关系；禁止拼接其他 episode、预录素材或不同步的画面。
 - `demo-preview.jpg` 必须从最终 `demo.mp4` 的实际帧中提取，并尽量同时展示上述三个视图和目标检测证据。
 - 任一必需视图缺失、冻结或录制失败时，不得将 demo 标记为有效；必须在 `metrics.json` 中分别记录 `panorama_recorded`、`rviz_memory_view_recorded`、`unity_third_person_recorded` 及失败原因。
+- 实时面板未录制、未收到本轮数据，或已有 VLM 输出却未产生 caption 时，同样不得将 demo 标记为有效；必须记录 `data_panel_recorded`、`vlm_outputs_received` 和 `vlm_result_captions_shown`。
 
 ## 每次 episode 必须生成的文件
 

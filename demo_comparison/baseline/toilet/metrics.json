@@ -1,0 +1,33 @@
+{
+  "run_name": "objnav-latency-toilet-20260909-03",
+  "success": false,
+  "stop_reason": "timeout",
+  "duration_s": 300.016,
+  "event_times_s": {
+    "episode_start": 0.005677,
+    "yolo_target_detected": 65.662459,
+    "semantic_projection_ready": 66.729988,
+    "object_memory_associated": 66.730287,
+    "episode_end": 300.005878
+  },
+  "event_counts": {
+    "episode_start": 1,
+    "yolo_target_detected": 1,
+    "semantic_projection_ready": 13,
+    "object_memory_associated": 13,
+    "episode_end": 1
+  },
+  "topic_counts": {
+    "state_estimation": 54421,
+    "way_point": 242,
+    "cmd_vel": 12595,
+    "semantic_image": 932,
+    "detection_result": 563,
+    "global_path": 241,
+    "object_nodes_list": 466,
+    "target_instruction": 2
+  },
+  "travel_distance_m": 136.843,
+  "demo_recorded": true,
+  "planner_path_generated": false
+}

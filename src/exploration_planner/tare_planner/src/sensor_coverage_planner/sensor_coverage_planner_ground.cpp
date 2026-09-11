@@ -11,6 +11,9 @@
 
 #include "sensor_coverage_planner/sensor_coverage_planner_ground.h"
 #include "graph/graph.h"
+#include <algorithm>
+#include <cctype>
+#include <limits>
 #include <memory>
 #include <unordered_map>
 #include <tf2/LinearMath/Matrix3x3.h>
@@ -20,6 +23,30 @@ using json = nlohmann::json;
 using namespace std::chrono_literals;
 
 namespace sensor_coverage_planner_3d_ns {
+namespace {
+std::string NormalizeRoomName(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char character) {
+                   return static_cast<char>(std::tolower(character));
+                 });
+  const auto first = value.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) {
+    return "";
+  }
+  value.erase(0, first);
+  const auto last = value.find_last_not_of(" \t\r\n");
+  value.erase(last + 1);
+  constexpr const char *kInThePrefix = "in the ";
+  constexpr const char *kThePrefix = "the ";
+  if (value.rfind(kInThePrefix, 0) == 0) {
+    value.erase(0, std::char_traits<char>::length(kInThePrefix));
+  } else if (value.rfind(kThePrefix, 0) == 0) {
+    value.erase(0, std::char_traits<char>::length(kThePrefix));
+  }
+  return value;
+}
+}  // namespace
+
 void SensorCoveragePlanner3D::ReadParameters() {
   this->declare_parameter<std::string>("sub_start_exploration_topic_",
                                        "/exploration_start");
@@ -72,6 +99,12 @@ void SensorCoveragePlanner3D::ReadParameters() {
   this->declare_parameter<double>("kLookAheadDistance", 5.0);
   this->declare_parameter<double>("kExtendWayPointDistanceBig", 8.0);
   this->declare_parameter<double>("kExtendWayPointDistanceSmall", 3.0);
+  this->declare_parameter<double>("kPotentialTargetApproachTolerance", 0.3);
+  this->declare_parameter<double>("kPotentialTargetNoProgressTimeout", 10.0);
+  this->declare_parameter<double>("kPotentialTargetProgressThreshold", 0.1);
+  this->declare_parameter<double>("kPotentialTargetVlmWaitTimeout", 15.0);
+  this->declare_parameter<double>("kFoundObjectPathDistanceThreshold", 1.0);
+  this->declare_parameter<double>("kFoundObjectEuclideanDistanceThreshold", 2.0);
 
   // Int
   this->declare_parameter<int>("kDirectionChangeCounterThr", 4);
@@ -239,6 +272,18 @@ void SensorCoveragePlanner3D::ReadParameters() {
   this->get_parameter("kExtendWayPointDistanceBig", kExtendWayPointDistanceBig);
   this->get_parameter("kExtendWayPointDistanceSmall",
                       kExtendWayPointDistanceSmall);
+  this->get_parameter("kPotentialTargetApproachTolerance",
+                      kPotentialTargetApproachTolerance);
+  this->get_parameter("kPotentialTargetNoProgressTimeout",
+                      kPotentialTargetNoProgressTimeout);
+  this->get_parameter("kPotentialTargetProgressThreshold",
+                      kPotentialTargetProgressThreshold);
+  this->get_parameter("kPotentialTargetVlmWaitTimeout",
+                      kPotentialTargetVlmWaitTimeout);
+  this->get_parameter("kFoundObjectPathDistanceThreshold",
+                      kFoundObjectPathDistanceThreshold);
+  this->get_parameter("kFoundObjectEuclideanDistanceThreshold",
+                      kFoundObjectEuclideanDistanceThreshold);
 
   this->get_parameter("kDirectionChangeCounterThr", kDirectionChangeCounterThr);
   this->get_parameter("kDirectionNoChangeCounterThr",
@@ -484,6 +529,21 @@ void SensorCoveragePlanner3D::InitializeData() {
   object_ids_to_remove_ = std::vector<int>();
   obj_score_ = 0.0;
   considered_object_ids_ = std::set<int>();
+  potential_target_observation_state_ =
+      PotentialTargetObservationState::IDLE;
+  potential_target_approach_object_id_ = -1;
+  potential_target_approach_waypoint_ = geometry_msgs::msg::Point();
+  potential_target_waypoint_is_final_ = false;
+  potential_target_best_waypoint_distance_ =
+      std::numeric_limits<double>::max();
+  potential_target_last_progress_at_ = this->now();
+  potential_target_vlm_wait_started_at_ = this->now();
+  potential_target_final_review_requested_ = false;
+  potential_target_vlm_result_received_ = false;
+  potential_target_vlm_accepted_ = false;
+  potential_target_hold_active_ = false;
+  potential_target_terminal_confirmed_ = false;
+  approached_potential_target_ids_.clear();
 
   // Search and navigation conditions initialization
   room_condition_ = "";
@@ -694,6 +754,8 @@ bool SensorCoveragePlanner3D::initialize() {
       "/anchor_object_query", 5);
   target_object_spatial_pub_ = this->create_publisher<tare_planner::msg::TargetObjectWithSpatial>(
       "/target_object_spatial_query", 5);
+  potential_target_stop_pub_ =
+      this->create_publisher<std_msgs::msg::Int8>("/stop", 5);
   room_anchor_point_pub_ = this->create_publisher<geometry_msgs::msg::PointStamped>(
       "/room_anchor_point", 5);
 
@@ -968,6 +1030,9 @@ void SensorCoveragePlanner3D::ObjectNodeListCallback(
   int deleted_count = 0;
   int updated_count = 0;
   int skipped_count = 0;
+  const tare_planner::msg::ObjectNode *nearest_new_potential_target = nullptr;
+  double nearest_new_potential_target_distance =
+      std::numeric_limits<double>::max();
   
   for (const auto& node : msg->nodes) {
     // Convert to ConstSharedPtr for compatibility with existing UpdateObjectNode
@@ -981,6 +1046,11 @@ void SensorCoveragePlanner3D::ObjectNodeListCallback(
           continue;
         }
         object_ids_to_remove_.push_back(obj_id);
+        if (potential_target_observation_state_ !=
+                PotentialTargetObservationState::IDLE &&
+            obj_id == potential_target_approach_object_id_) {
+          StopPotentialTargetApproach("object_removed");
+        }
         deleted_count++;
       }
       continue;
@@ -996,11 +1066,743 @@ void SensorCoveragePlanner3D::ObjectNodeListCallback(
     representation_->UpdateObjectNode(node_ptr);
     representation_->GetLatestObjectNodeIndicesMutable().insert(node.object_id[0]);
     updated_count++;
+
+    const int object_id = node.object_id[0];
+    if (potential_target_observation_state_ !=
+            PotentialTargetObservationState::IDLE &&
+        object_id == potential_target_approach_object_id_ &&
+        node.label != "Potential Target" &&
+        node.label != target_object_) {
+      AbandonPotentialTarget("category_rejected");
+    }
+
+    if (!potential_target_terminal_confirmed_ && !found_object_ &&
+        !ask_found_object_ && potential_target_observation_state_ ==
+            PotentialTargetObservationState::IDLE &&
+        node.label == "Potential Target" &&
+        approached_potential_target_ids_.find(object_id) ==
+            approached_potential_target_ids_.end()) {
+      if (!std::isfinite(node.position.x) ||
+          !std::isfinite(node.position.y) ||
+          !std::isfinite(node.position.z)) {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "Cannot approach Potential Target %d: its 3D memory position "
+            "is not finite",
+            object_id);
+        continue;
+      }
+      const double dx = node.position.x - robot_position_.x;
+      const double dy = node.position.y - robot_position_.y;
+      const double distance = std::hypot(dx, dy);
+      if (distance < nearest_new_potential_target_distance) {
+        nearest_new_potential_target = &node;
+        nearest_new_potential_target_distance = distance;
+      }
+    }
+  }
+
+  if (nearest_new_potential_target != nullptr) {
+    StartPotentialTargetApproach(*nearest_new_potential_target);
   }
   
   RCLCPP_DEBUG(this->get_logger(), 
                "Batch processed: %d updated, %d deleted, %d skipped",
                updated_count, deleted_count, skipped_count);
+}
+
+void SensorCoveragePlanner3D::StartPotentialTargetApproach(
+    const tare_planner::msg::ObjectNode &object_node) {
+  if (object_node.object_id.empty()) {
+    return;
+  }
+
+  const int object_id = object_node.object_id[0];
+  if (!representation_->HasObjectNode(object_id)) {
+    return;
+  }
+
+  const auto &object_node_rep = representation_->GetObjectNodeRep(object_id);
+  if (!std::isfinite(object_node_rep.position_.x) ||
+      !std::isfinite(object_node_rep.position_.y) ||
+      !std::isfinite(object_node_rep.position_.z)) {
+    RCLCPP_WARN(this->get_logger(),
+                "Cannot approach Potential Target %d: its 3D memory "
+                "position is not finite",
+                object_id);
+    return;
+  }
+
+  double waypoint_distance = std::numeric_limits<double>::max();
+  double object_surface_distance = std::numeric_limits<double>::max();
+  bool is_final_observation_waypoint = false;
+  geometry_msgs::msg::Point observation_waypoint;
+  if (!SelectPotentialTargetObservationWaypoint(
+          object_node_rep, observation_waypoint, waypoint_distance,
+          object_surface_distance, is_final_observation_waypoint)) {
+    RCLCPP_WARN(this->get_logger(),
+                "Cannot approach Potential Target %d: unable to construct "
+                "an approach waypoint from its 3D memory position",
+                object_id);
+    return;
+  }
+
+  // Potential-target control owns the waypoint until this observation ends.
+  ResetRoomInfo();
+  enter_wrong_room_ = false;
+  viewpoint_manager_->SetEnterWrongRoom(false);
+  potential_target_observation_state_ =
+      PotentialTargetObservationState::APPROACHING;
+  potential_target_approach_object_id_ = object_id;
+  potential_target_approach_waypoint_ = observation_waypoint;
+  potential_target_waypoint_is_final_ = is_final_observation_waypoint;
+  potential_target_best_waypoint_distance_ = waypoint_distance;
+  potential_target_last_progress_at_ = this->now();
+  potential_target_final_review_requested_ = false;
+  potential_target_vlm_result_received_ = false;
+  potential_target_vlm_accepted_ = false;
+
+  geometry_msgs::msg::PointStamped waypoint;
+  waypoint.header.frame_id = kWorldFrameID;
+  waypoint.header.stamp = this->now();
+  waypoint.point = potential_target_approach_waypoint_;
+  waypoint_pub_->publish(waypoint);
+  RequestPotentialTargetFinalReview();
+
+  if (is_final_observation_waypoint) {
+    RCLCPP_WARN(
+        this->get_logger(),
+        "Potential Target %d has a valid 3D position: approaching the nearest "
+        "collision-free observation waypoint (%.2f, %.2f), "
+        "robot distance %.2f m, nearest object-cloud distance %.2f m < "
+        "%.2f m",
+        object_id, potential_target_approach_waypoint_.x,
+        potential_target_approach_waypoint_.y, waypoint_distance,
+        object_surface_distance, kFoundObjectEuclideanDistanceThreshold);
+  } else {
+    RCLCPP_WARN(
+        this->get_logger(),
+        "Potential Target %d has a valid 3D position: approach triggered "
+        "toward provisional waypoint (%.2f, %.2f), robot distance %.2f m, "
+        "nearest object-cloud distance %.2f m; the final collision-free "
+        "observation waypoint will be recomputed while approaching",
+        object_id, potential_target_approach_waypoint_.x,
+        potential_target_approach_waypoint_.y, waypoint_distance,
+        object_surface_distance);
+  }
+}
+
+double SensorCoveragePlanner3D::GetDistanceToObjectFootprint(
+    const geometry_msgs::msg::Point &position,
+    const representation_ns::ObjectNodeRep &object_node) const {
+  double min_x = std::numeric_limits<double>::max();
+  double min_y = std::numeric_limits<double>::max();
+  double max_x = std::numeric_limits<double>::lowest();
+  double max_y = std::numeric_limits<double>::lowest();
+  int valid_corner_count = 0;
+  for (const auto &corner : object_node.bbox3d_) {
+    if (!std::isfinite(corner.x) || !std::isfinite(corner.y)) {
+      continue;
+    }
+    min_x = std::min(min_x, corner.x);
+    min_y = std::min(min_y, corner.y);
+    max_x = std::max(max_x, corner.x);
+    max_y = std::max(max_y, corner.y);
+    ++valid_corner_count;
+  }
+
+  // Older or incomplete memory messages may not contain a usable bbox.  Keep
+  // the behavior defined by falling back to the published memory centroid.
+  if (valid_corner_count < 2 || max_x - min_x <= 1e-3 ||
+      max_y - min_y <= 1e-3) {
+    return std::hypot(position.x - object_node.position_.x,
+                      position.y - object_node.position_.y);
+  }
+
+  const double dx =
+      std::max({min_x - position.x, 0.0, position.x - max_x});
+  const double dy =
+      std::max({min_y - position.y, 0.0, position.y - max_y});
+  return std::hypot(dx, dy);
+}
+
+bool SensorCoveragePlanner3D::GetClosestPotentialTargetCloudPoint(
+    const representation_ns::ObjectNodeRep &object_node,
+    const geometry_msgs::msg::Point &reference_position,
+    geometry_msgs::msg::Point &closest_point) const {
+  pcl::PointCloud<pcl::PointXYZ> object_cloud;
+  pcl::fromROSMsg(object_node.cloud_, object_cloud);
+
+  double closest_squared_distance = std::numeric_limits<double>::max();
+  bool found = false;
+  for (const auto &point : object_cloud.points) {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+        !std::isfinite(point.z)) {
+      continue;
+    }
+    const double dx = point.x - reference_position.x;
+    const double dy = point.y - reference_position.y;
+    const double dz = point.z - reference_position.z;
+    const double squared_distance = dx * dx + dy * dy + dz * dz;
+    if (squared_distance < closest_squared_distance) {
+      closest_squared_distance = squared_distance;
+      closest_point.x = point.x;
+      closest_point.y = point.y;
+      closest_point.z = point.z;
+      found = true;
+    }
+  }
+
+  // A finite memory centroid still represents a usable 3D target when an
+  // older ObjectNode message has no decodable point samples.
+  if (!found && std::isfinite(object_node.position_.x) &&
+      std::isfinite(object_node.position_.y) &&
+      std::isfinite(object_node.position_.z)) {
+    closest_point = object_node.position_;
+    found = true;
+  }
+  return found;
+}
+
+bool SensorCoveragePlanner3D::SelectPotentialTargetObservationWaypoint(
+    const representation_ns::ObjectNodeRep &object_node,
+    geometry_msgs::msg::Point &observation_waypoint,
+    double &robot_distance, double &object_surface_distance,
+    bool &is_final_observation_waypoint) {
+  is_final_observation_waypoint = false;
+
+  geometry_msgs::msg::Point robot_point;
+  robot_point.x = robot_position_.x;
+  robot_point.y = robot_position_.y;
+  robot_point.z = robot_position_.z;
+  geometry_msgs::msg::Point closest_object_point;
+  if (!GetClosestPotentialTargetCloudPoint(
+          object_node, robot_point, closest_object_point)) {
+    return false;
+  }
+  const double robot_surface_distance =
+      std::hypot(robot_point.x - closest_object_point.x,
+                 robot_point.y - closest_object_point.y);
+
+  // The target point is the object-cloud sample nearest to the robot.  Once
+  // the robot is already within the requested radius, its current pose is a
+  // known traversable observation position and no extra motion is needed.
+  if (robot_surface_distance < kFoundObjectEuclideanDistanceThreshold) {
+    observation_waypoint = robot_point;
+    robot_distance = 0.0;
+    object_surface_distance = robot_surface_distance;
+    is_final_observation_waypoint = true;
+    return true;
+  }
+
+  int final_viewpoint_index = -1;
+  double final_robot_distance = std::numeric_limits<double>::max();
+  double final_surface_distance = std::numeric_limits<double>::max();
+  double progress_robot_distance = std::numeric_limits<double>::max();
+  double progress_surface_distance = std::numeric_limits<double>::max();
+  geometry_msgs::msg::Point progress_waypoint;
+  int progress_viewpoint_index = -1;
+  for (const int viewpoint_index :
+       viewpoint_manager_->GetViewPointCandidateIndices()) {
+    if (!viewpoint_manager_->InRange(viewpoint_index) ||
+        !viewpoint_manager_->IsViewPointCandidate(viewpoint_index) ||
+        viewpoint_manager_->ViewPointInCollision(viewpoint_index)) {
+      continue;
+    }
+    const auto candidate =
+        viewpoint_manager_->GetViewPointPosition(viewpoint_index);
+    if (!std::isfinite(candidate.x) || !std::isfinite(candidate.y) ||
+        !std::isfinite(candidate.z)) {
+      continue;
+    }
+    const double surface_distance =
+        std::hypot(candidate.x - closest_object_point.x,
+                   candidate.y - closest_object_point.y);
+    if (!std::isfinite(surface_distance)) {
+      continue;
+    }
+    const double candidate_robot_distance =
+        std::hypot(candidate.x - robot_position_.x,
+                   candidate.y - robot_position_.y);
+    if (surface_distance < kFoundObjectEuclideanDistanceThreshold) {
+      if (candidate_robot_distance < final_robot_distance) {
+        final_viewpoint_index = viewpoint_index;
+        final_robot_distance = candidate_robot_distance;
+        final_surface_distance = surface_distance;
+      }
+      continue;
+    }
+
+    // No final observation point may exist yet when the target is first seen
+    // near the edge of the explored map. Retain the collision-free viewpoint that
+    // makes the most progress toward the 3D object position, so APPROACHING can
+    // start immediately and the local map can grow on the way.
+    if (candidate_robot_distance > kPotentialTargetApproachTolerance &&
+        surface_distance + kPotentialTargetProgressThreshold <
+            robot_surface_distance &&
+        (surface_distance < progress_surface_distance ||
+         (std::abs(surface_distance - progress_surface_distance) <= 1e-6 &&
+          candidate_robot_distance < progress_robot_distance))) {
+      progress_robot_distance = candidate_robot_distance;
+      progress_surface_distance = surface_distance;
+      progress_waypoint = candidate;
+      progress_viewpoint_index = viewpoint_index;
+    }
+  }
+
+  if (final_viewpoint_index >= 0) {
+    observation_waypoint =
+        viewpoint_manager_->GetViewPointPosition(final_viewpoint_index);
+    robot_distance = final_robot_distance;
+    object_surface_distance = final_surface_distance;
+    is_final_observation_waypoint = true;
+    return true;
+  }
+
+  // The exploration graph can lag behind a newly visible object. Project a
+  // deterministic 1.5 m standoff onto the local viewpoint grid and use it as
+  // soon as the grid says it is collision-free.
+  const double standoff_distance =
+      0.75 * kFoundObjectEuclideanDistanceThreshold;
+  if (robot_surface_distance > standoff_distance) {
+    const double ratio = standoff_distance / robot_surface_distance;
+    const Eigen::Vector3d desired_position(
+        closest_object_point.x +
+            (robot_point.x - closest_object_point.x) * ratio,
+        closest_object_point.y +
+            (robot_point.y - closest_object_point.y) * ratio,
+        robot_position_.z);
+    const int viewpoint_index =
+        viewpoint_manager_->GetViewPointInd(desired_position);
+    if (viewpoint_manager_->InRange(viewpoint_index) &&
+        !viewpoint_manager_->ViewPointInCollision(viewpoint_index)) {
+      const auto candidate =
+          viewpoint_manager_->GetViewPointPosition(viewpoint_index);
+      const double surface_distance =
+          std::hypot(candidate.x - closest_object_point.x,
+                     candidate.y - closest_object_point.y);
+      if (surface_distance < kFoundObjectEuclideanDistanceThreshold) {
+        observation_waypoint = candidate;
+        robot_distance =
+            std::hypot(candidate.x - robot_position_.x,
+                       candidate.y - robot_position_.y);
+        object_surface_distance = surface_distance;
+        is_final_observation_waypoint = true;
+        return true;
+      }
+    }
+  }
+
+  if (progress_viewpoint_index >= 0) {
+    observation_waypoint = progress_waypoint;
+    robot_distance = progress_robot_distance;
+    object_surface_distance = progress_surface_distance;
+    return true;
+  }
+
+  return false;
+}
+
+void SensorCoveragePlanner3D::UpdatePotentialTargetApproach() {
+  if (potential_target_observation_state_ ==
+      PotentialTargetObservationState::IDLE) {
+    return;
+  }
+
+  if (!representation_->HasObjectNode(potential_target_approach_object_id_)) {
+    StopPotentialTargetApproach("object_missing");
+    return;
+  }
+
+  const auto &object_node = representation_->GetObjectNodeRep(
+      potential_target_approach_object_id_);
+  if (object_node.label_ != "Potential Target" &&
+      object_node.label_ != target_object_) {
+    AbandonPotentialTarget("category_rejected");
+    return;
+  }
+
+  if (potential_target_observation_state_ ==
+      PotentialTargetObservationState::APPROACHING) {
+    const double waypoint_distance = std::hypot(
+        robot_position_.x - potential_target_approach_waypoint_.x,
+        robot_position_.y - potential_target_approach_waypoint_.y);
+    geometry_msgs::msg::Point robot_point;
+    robot_point.x = robot_position_.x;
+    robot_point.y = robot_position_.y;
+    robot_point.z = robot_position_.z;
+    geometry_msgs::msg::Point closest_object_point;
+    if (!GetClosestPotentialTargetCloudPoint(
+            object_node, robot_point, closest_object_point)) {
+      AbandonPotentialTarget("invalid_object_cloud");
+      return;
+    }
+    const double object_surface_distance =
+        std::hypot(robot_point.x - closest_object_point.x,
+                   robot_point.y - closest_object_point.y);
+    const double waypoint_object_distance =
+        std::hypot(potential_target_approach_waypoint_.x -
+                       closest_object_point.x,
+                   potential_target_approach_waypoint_.y -
+                       closest_object_point.y);
+
+    bool waypoint_invalid = false;
+    std::string waypoint_invalid_reason;
+    const Eigen::Vector3d waypoint_position(
+        potential_target_approach_waypoint_.x,
+        potential_target_approach_waypoint_.y,
+        potential_target_approach_waypoint_.z);
+    const int sampled_viewpoint_index =
+        viewpoint_manager_->GetViewPointInd(waypoint_position);
+    if (viewpoint_manager_->InRange(sampled_viewpoint_index)) {
+      if (viewpoint_manager_->ViewPointInCollision(
+              sampled_viewpoint_index)) {
+        waypoint_invalid = true;
+        waypoint_invalid_reason = "viewpoint_became_occupied";
+      }
+    }
+    if (potential_target_waypoint_is_final_ &&
+        waypoint_object_distance >=
+            kFoundObjectEuclideanDistanceThreshold) {
+      waypoint_invalid = true;
+      waypoint_invalid_reason = "object_cloud_moved_outside_goal_radius";
+    }
+
+    // Keep a valid waypoint stable. Resample only when it becomes blocked or
+    // when a provisional staging goal can be upgraded to a final
+    // observation point, preventing frame-to-frame waypoint jitter.
+    if (waypoint_invalid || !potential_target_waypoint_is_final_) {
+      geometry_msgs::msg::Point replacement_waypoint;
+      double replacement_robot_distance =
+          std::numeric_limits<double>::max();
+      double replacement_surface_distance =
+          std::numeric_limits<double>::max();
+      bool replacement_is_final = false;
+      const bool replacement_found =
+          SelectPotentialTargetObservationWaypoint(
+              object_node, replacement_waypoint, replacement_robot_distance,
+              replacement_surface_distance, replacement_is_final);
+      const bool replacement_improves_target_distance =
+          replacement_found &&
+          replacement_surface_distance + kPotentialTargetProgressThreshold <
+              waypoint_object_distance;
+      const bool replacement_upgrades_to_final =
+          replacement_found && replacement_is_final &&
+          !potential_target_waypoint_is_final_;
+      const bool replacement_changes_position =
+          replacement_found &&
+          std::hypot(replacement_waypoint.x -
+                         potential_target_approach_waypoint_.x,
+                     replacement_waypoint.y -
+                         potential_target_approach_waypoint_.y) >
+              kPotentialTargetApproachTolerance;
+
+      if (replacement_found && replacement_changes_position &&
+          (waypoint_invalid || replacement_upgrades_to_final ||
+           replacement_improves_target_distance)) {
+        potential_target_approach_waypoint_ = replacement_waypoint;
+        potential_target_waypoint_is_final_ = replacement_is_final;
+        potential_target_best_waypoint_distance_ =
+            replacement_robot_distance;
+        potential_target_last_progress_at_ = this->now();
+
+        geometry_msgs::msg::PointStamped waypoint;
+        waypoint.header.frame_id = kWorldFrameID;
+        waypoint.header.stamp = this->now();
+        waypoint.point = potential_target_approach_waypoint_;
+        waypoint_pub_->publish(waypoint);
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Potential Target %d dynamically replaced its approach waypoint "
+            "because %s: new %s waypoint (%.2f, %.2f), nearest "
+            "object-cloud distance %.2f m",
+            potential_target_approach_object_id_,
+            waypoint_invalid
+                ? waypoint_invalid_reason.c_str()
+                : "a better mapped target point became available",
+            replacement_is_final ? "nearest traversable observation"
+                                 : "provisional approach",
+            potential_target_approach_waypoint_.x,
+            potential_target_approach_waypoint_.y,
+            replacement_surface_distance);
+        return;
+      }
+
+      if (waypoint_invalid) {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "Potential Target %d approach waypoint is invalid (%s), but no "
+            "different traversable replacement is available yet",
+            potential_target_approach_object_id_,
+            waypoint_invalid_reason.c_str());
+      }
+    }
+
+    const bool observation_pose_is_in_arrival_range =
+        !waypoint_invalid &&
+        waypoint_distance <= kPotentialTargetApproachTolerance &&
+        object_surface_distance < kFoundObjectEuclideanDistanceThreshold;
+
+    if (observation_pose_is_in_arrival_range) {
+      potential_target_observation_state_ =
+          PotentialTargetObservationState::OBSERVING;
+      potential_target_approach_waypoint_ = robot_position_;
+      potential_target_vlm_wait_started_at_ = this->now();
+      reset_waypoint_ = true;
+
+      geometry_msgs::msg::PointStamped stop_waypoint;
+      stop_waypoint.header.frame_id = kWorldFrameID;
+      stop_waypoint.header.stamp = this->now();
+      stop_waypoint.point = potential_target_approach_waypoint_;
+      waypoint_pub_->publish(stop_waypoint);
+      SetPotentialTargetHold(true);
+      const int observed_object_id = potential_target_approach_object_id_;
+      const bool review_pending = potential_target_final_review_requested_ ||
+                                  RequestPotentialTargetFinalReview();
+      RCLCPP_INFO(this->get_logger(),
+                  "Reached observation point for Potential Target %d; "
+                  "waypoint distance %.2f m <= %.2f m and distance to "
+                  "nearest object-cloud point %.2f m < %.2f m; "
+                  "cleared the exploration waypoint, holding position, and "
+                  "%s its final VLM review",
+                  observed_object_id,
+                  waypoint_distance,
+                  kPotentialTargetApproachTolerance,
+                  object_surface_distance,
+                  kFoundObjectEuclideanDistanceThreshold,
+                  review_pending ? "is awaiting" : "could not submit");
+      if (potential_target_vlm_result_received_ &&
+          potential_target_vlm_accepted_) {
+        ConfirmPotentialTargetAtObservation();
+      }
+      return;
+    }
+
+    if (waypoint_distance <= kPotentialTargetApproachTolerance) {
+      geometry_msgs::msg::Point replacement_waypoint;
+      double replacement_robot_distance =
+          std::numeric_limits<double>::max();
+      double replacement_surface_distance =
+          std::numeric_limits<double>::max();
+      bool replacement_is_final = false;
+      if (SelectPotentialTargetObservationWaypoint(
+              object_node, replacement_waypoint, replacement_robot_distance,
+              replacement_surface_distance, replacement_is_final) &&
+          replacement_robot_distance > kPotentialTargetApproachTolerance) {
+        potential_target_approach_waypoint_ = replacement_waypoint;
+        potential_target_waypoint_is_final_ = replacement_is_final;
+        potential_target_best_waypoint_distance_ = replacement_robot_distance;
+        potential_target_last_progress_at_ = this->now();
+        geometry_msgs::msg::PointStamped waypoint;
+        waypoint.header.frame_id = kWorldFrameID;
+        waypoint.header.stamp = this->now();
+        waypoint.point = potential_target_approach_waypoint_;
+        waypoint_pub_->publish(waypoint);
+        RCLCPP_INFO(this->get_logger(),
+                    "Potential Target %d memory geometry changed; selected "
+                    "replacement %s waypoint (%.2f, %.2f), "
+                    "surface distance %.2f m",
+                    potential_target_approach_object_id_,
+                    replacement_is_final ? "observation" : "approach",
+                    potential_target_approach_waypoint_.x,
+                    potential_target_approach_waypoint_.y,
+                    replacement_surface_distance);
+        return;
+      }
+      AbandonPotentialTarget("observation_point_invalidated");
+      return;
+    }
+
+    if (potential_target_best_waypoint_distance_ - waypoint_distance >=
+        kPotentialTargetProgressThreshold) {
+      potential_target_best_waypoint_distance_ = waypoint_distance;
+      potential_target_last_progress_at_ = this->now();
+    }
+
+    const double no_progress_elapsed =
+        (this->now() - potential_target_last_progress_at_).seconds();
+    if (no_progress_elapsed >= kPotentialTargetNoProgressTimeout) {
+      AbandonPotentialTarget("approach_no_progress");
+    }
+    return;
+  }
+
+  if (!potential_target_final_review_requested_) {
+    RequestPotentialTargetFinalReview();
+  }
+
+  const double vlm_wait_elapsed =
+      (this->now() - potential_target_vlm_wait_started_at_).seconds();
+  if (vlm_wait_elapsed >= kPotentialTargetVlmWaitTimeout) {
+    AbandonPotentialTarget("vlm_wait_timeout");
+    return;
+  }
+
+  if (potential_target_observation_state_ ==
+      PotentialTargetObservationState::OBSERVING) {
+    RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Holding observation position for Potential Target %d while VLM "
+        "review is pending",
+        potential_target_approach_object_id_);
+  }
+}
+
+bool SensorCoveragePlanner3D::RequestPotentialTargetFinalReview() {
+  if (potential_target_final_review_requested_ ||
+      potential_target_approach_object_id_ < 0 ||
+      !representation_->HasObjectNode(potential_target_approach_object_id_)) {
+    return false;
+  }
+
+  auto &object_node = representation_->GetObjectNodeRep(
+      potential_target_approach_object_id_);
+  if (object_node.img_path_.empty() ||
+      !std::filesystem::exists(object_node.img_path_)) {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Cannot submit final VLM review for Potential Target %d: image %s "
+        "is not available",
+        potential_target_approach_object_id_, object_node.img_path_.c_str());
+    return false;
+  }
+
+  std::string room_label;
+  if (representation_->HasRoomNode(object_node.room_id_)) {
+    room_label =
+        representation_->GetRoomNode(object_node.room_id_).GetRoomLabel();
+  }
+
+  // At an observation point the object-room relation can lag behind room
+  // segmentation by several planning cycles.  The robot is already next to
+  // and looking at the candidate, so its current labeled room is the safest
+  // temporary context until the object relation catches up.
+  if (room_label.empty() &&
+      representation_->HasRoomNode(current_room_id_)) {
+    room_label =
+        representation_->GetRoomNode(current_room_id_).GetRoomLabel();
+  }
+
+  if (spatial_condition_.empty()) {
+    tare_planner::msg::TargetObject target_object_msg;
+    target_object_msg.header.frame_id = kWorldFrameID;
+    target_object_msg.header.stamp = this->now();
+    target_object_msg.object_id = potential_target_approach_object_id_;
+    target_object_msg.object_label = target_object_;
+    target_object_msg.img_path = object_node.img_path_;
+    target_object_msg.room_label = room_label;
+    target_object_msg.object_position = object_node.position_;
+    target_object_msg.is_target = false;
+    target_object_pub_->publish(target_object_msg);
+  } else {
+    tare_planner::msg::TargetObjectWithSpatial target_object_msg;
+    target_object_msg.header.frame_id = kWorldFrameID;
+    target_object_msg.header.stamp = this->now();
+    target_object_msg.object_id = potential_target_approach_object_id_;
+    target_object_msg.object_label = target_object_;
+    target_object_msg.img_path = object_node.img_path_;
+    target_object_msg.room_label = room_label;
+    target_object_msg.bbox3d = object_node.bbox3d_;
+    target_object_msg.viewpoint_ids.assign(
+        object_node.visible_viewpoint_indices_.begin(),
+        object_node.visible_viewpoint_indices_.end());
+    target_object_msg.is_target = false;
+    target_object_spatial_pub_->publish(target_object_msg);
+  }
+
+  object_node.SetIsConsidered(true);
+  considered_object_ids_.insert(potential_target_approach_object_id_);
+  potential_target_final_review_requested_ = true;
+  RCLCPP_WARN(this->get_logger(),
+              "Submitted final VLM review for observed Potential Target %d "
+              "with room context '%s'",
+              potential_target_approach_object_id_, room_label.c_str());
+  return true;
+}
+
+void SensorCoveragePlanner3D::ConfirmPotentialTargetAtObservation() {
+  const int object_id = potential_target_approach_object_id_;
+  if (object_id < 0 || !representation_->HasObjectNode(object_id)) {
+    AbandonPotentialTarget("confirmed_object_missing");
+    return;
+  }
+
+  auto &object_node = representation_->GetObjectNodeRep(object_id);
+  found_object_ = true;
+  found_object_id_ = object_id;
+  found_object_position_ = object_node.position_;
+  found_object_room_id_ = object_node.room_id_;
+  found_object_distance_ = 0.0;
+  ask_found_object_ = true;
+  potential_target_terminal_confirmed_ = true;
+  reset_waypoint_ = true;
+  grid_world_->SetObjectFound(false);
+  local_coverage_planner_->SetObjectFound(false);
+  StopPotentialTargetApproach("target_confirmed_at_observation");
+  RCLCPP_INFO(this->get_logger(),
+              "Confirmed Potential Target %d at its observation point; "
+              "finishing without another navigation goal",
+              object_id);
+}
+
+void SensorCoveragePlanner3D::SetPotentialTargetHold(bool hold) {
+  if (potential_target_hold_active_ == hold) {
+    return;
+  }
+  std_msgs::msg::Int8 stop_msg;
+  stop_msg.data = hold ? 2 : 0;
+  potential_target_stop_pub_->publish(stop_msg);
+  potential_target_hold_active_ = hold;
+}
+
+void SensorCoveragePlanner3D::StopPotentialTargetApproach(
+    const std::string &reason) {
+  if (potential_target_observation_state_ ==
+      PotentialTargetObservationState::IDLE) {
+    return;
+  }
+
+  const int object_id = potential_target_approach_object_id_;
+  if (potential_target_hold_active_) {
+    // Invalidate the exploration lookahead before releasing /stop so the
+    // controller cannot briefly turn toward the stale pre-observation path.
+    reset_waypoint_ = true;
+    potential_target_approach_waypoint_ = robot_position_;
+    geometry_msgs::msg::PointStamped stop_waypoint;
+    stop_waypoint.header.frame_id = kWorldFrameID;
+    stop_waypoint.header.stamp = this->now();
+    stop_waypoint.point = potential_target_approach_waypoint_;
+    waypoint_pub_->publish(stop_waypoint);
+  }
+  potential_target_observation_state_ =
+      PotentialTargetObservationState::IDLE;
+  potential_target_approach_object_id_ = -1;
+  potential_target_waypoint_is_final_ = false;
+  potential_target_final_review_requested_ = false;
+  potential_target_vlm_result_received_ = false;
+  potential_target_vlm_accepted_ = false;
+  SetPotentialTargetHold(false);
+  RCLCPP_INFO(this->get_logger(),
+              "Potential Target %d observation approach ended: %s",
+              object_id, reason.c_str());
+}
+
+void SensorCoveragePlanner3D::AbandonPotentialTarget(
+    const std::string &reason) {
+  if (potential_target_observation_state_ ==
+      PotentialTargetObservationState::IDLE) {
+    return;
+  }
+
+  const int object_id = potential_target_approach_object_id_;
+  if (representation_->HasObjectNode(object_id)) {
+    auto &object_node = representation_->GetObjectNodeRep(object_id);
+    object_node.SetIsConsidered(true);
+    object_node.SetIsConsideredStrong(true);
+    considered_object_ids_.insert(object_id);
+  }
+  approached_potential_target_ids_.insert(object_id);
+  StopPotentialTargetApproach(reason);
 }
 
 void SensorCoveragePlanner3D::DoorCloudCallback(
@@ -1353,6 +2155,10 @@ void SensorCoveragePlanner3D::TargetObjectInstructionCallback(
   attribute_condition_ = target_object_instruction_msg->attribute_condition;
   last_target_object_instruction_time_ = this->now();
 
+  StopPotentialTargetApproach("new_instruction");
+  approached_potential_target_ids_.clear();
+  considered_object_ids_.clear();
+
   // reset considered object ids
   for (auto &object_id_pair : representation_->GetObjectNodeRepMapMutable())
   {
@@ -1398,8 +2204,46 @@ void SensorCoveragePlanner3D::TargetObjectCallback(
     return;
   }
 
+  if (potential_target_observation_state_ !=
+      PotentialTargetObservationState::IDLE) {
+    if (candidate_found_object_id != potential_target_approach_object_id_) {
+      RCLCPP_INFO(this->get_logger(),
+                  "Ignoring VLM result for object %d while approaching "
+                  "Potential Target %d",
+                  candidate_found_object_id,
+                  potential_target_approach_object_id_);
+      return;
+    }
+
+    potential_target_vlm_result_received_ = true;
+    potential_target_vlm_accepted_ = target_object_msg->is_target;
+    if (!target_object_msg->is_target) {
+      RCLCPP_INFO(this->get_logger(),
+                  "VLM rejected Potential Target %d during approach; "
+                  "interrupting observation approach and resuming exploration",
+                  candidate_found_object_id);
+      AbandonPotentialTarget("target_rejected");
+      return;
+    }
+
+    if (potential_target_observation_state_ ==
+        PotentialTargetObservationState::APPROACHING) {
+      RCLCPP_INFO(this->get_logger(),
+                  "VLM accepted Potential Target %d; continuing to its "
+                  "observation point",
+                  candidate_found_object_id);
+      return;
+    }
+
+    ConfirmPotentialTargetAtObservation();
+    return;
+  }
+
   nav_msgs::msg::Path path;
-  double candidate_found_object_distance = keypose_graph_->GetShortestPath(robot_position_, candidate_found_object_position_, false, path, true);
+  const double candidate_found_object_distance =
+      keypose_graph_->GetShortestPath(robot_position_,
+                                      candidate_found_object_position_, false,
+                                      path, true);
 
   if (target_object_msg->is_target)
   {
@@ -1430,6 +2274,7 @@ void SensorCoveragePlanner3D::TargetObjectCallback(
         RCLCPP_INFO(this->get_logger(), "✅✅✅ Update to a closer target object id: %d", found_object_id_);
       }
     }
+
   }
 }
 
@@ -1478,6 +2323,7 @@ void SensorCoveragePlanner3D::ResetFoundObjectInfo()
 {
   found_object_ = false;
   ask_found_object_ = false;
+  potential_target_terminal_confirmed_ = false;
   found_object_id_ = -1;
   found_object_room_id_ = -1;
   found_object_distance_ = -1.0;
@@ -3314,7 +4160,11 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
 
 void SensorCoveragePlanner3D::PublishWaypoint() {
   geometry_msgs::msg::PointStamped waypoint;
-  if (exploration_finished_ && near_home_ && kRushHome) {
+  if (potential_target_observation_state_ !=
+      PotentialTargetObservationState::IDLE) {
+    waypoint.point = potential_target_approach_waypoint_;
+  }
+  else if (exploration_finished_ && near_home_ && kRushHome) {
     // if the whole environment is explored, and the robot is near home, go back to home
     waypoint.point.x = initial_position_.x();
     waypoint.point.y = initial_position_.y();
@@ -3333,7 +4183,10 @@ void SensorCoveragePlanner3D::PublishWaypoint() {
     SendInRoomWaypoint();
     return;
   }
-  else if ((ask_vlm_finish_room_ || ask_vlm_change_room_ || ask_found_object_) && !transit_across_room_)
+  else if ((ask_found_object_ ||
+            (!found_object_ &&
+             (ask_vlm_finish_room_ || ask_vlm_change_room_))) &&
+           !transit_across_room_)
   {
     if (ask_vlm_finish_room_)
     {
@@ -3533,7 +4386,11 @@ void SensorCoveragePlanner3D::execute() {
   }
 
   ProcessObjectNodes();
+  UpdatePotentialTargetApproach();
   CheckObjectFound();
+  const bool potential_target_active =
+      potential_target_observation_state_ !=
+      PotentialTargetObservationState::IDLE;
   if (dynamic_environment_)
   {
     CheckAnchorObjectFound();
@@ -3549,10 +4406,12 @@ void SensorCoveragePlanner3D::execute() {
   overall_processing_timer.Start();
   if (keypose_cloud_update_) {
     keypose_cloud_update_ = false;
-    UpdateRoomLabel();
-    SetCurrentRoomId();
+    if (!potential_target_active) {
+      UpdateRoomLabel();
+      SetCurrentRoomId();
+    }
     // -------- Transit across rooms --------
-    if (transit_across_room_ && !at_room_)
+    if (!potential_target_active && transit_across_room_ && !at_room_)
     {
       geometry_msgs::msg::PointStamped::SharedPtr geomsg(
           new geometry_msgs::msg::PointStamped());
@@ -3564,7 +4423,7 @@ void SensorCoveragePlanner3D::execute() {
       GoalPointCallback(geomsg);
       SetStartAndEndRoomId();
     }
-    if (at_room_)
+    if (!potential_target_active && at_room_)
     {
       room_guide_counter_++;
       reset_waypoint_ = true;
@@ -3581,7 +4440,9 @@ void SensorCoveragePlanner3D::execute() {
       }
     }
 
-    CountDirectionChange();
+    if (!potential_target_active) {
+      CountDirectionChange();
+    }
 
     misc_utils_ns::Timer update_representation_timer("update representation");
     update_representation_timer.Start();
@@ -3656,7 +4517,7 @@ void SensorCoveragePlanner3D::execute() {
     }
 
     // Handle room finishing and changing
-    if (current_room_id_ != -1)
+    if (!potential_target_active && current_room_id_ != -1)
     {
       if (!representation_->HasRoomNode(current_room_id_)) {
         RCLCPP_WARN(this->get_logger(), "Current room with id %d does not exist in representation, reset to -1", current_room_id_);
@@ -3676,9 +4537,17 @@ void SensorCoveragePlanner3D::execute() {
           }
         }
         
+        // Once a target has been confirmed, room-level waiting must not
+        // overwrite the target-navigation waypoint with the robot's current
+        // position.  This can otherwise deadlock when confirmation happens in
+        // a room that has already been marked complete.
+        if (found_object_) {
+          ask_vlm_finish_room_ = false;
+          ask_vlm_change_room_ = false;
+        }
         // if the room is finished, ask the vlm for next room to explore
-        if ((grid_world_->IsRoomFinished() && local_coverage_planner_->IsLocalCoverageComplete() && !transit_across_room_)
-            || (current_room.area_ < 10.0 && stayed_in_room_counter_ > 20)) {
+        else if ((grid_world_->IsRoomFinished() && local_coverage_planner_->IsLocalCoverageComplete() && !transit_across_room_)
+                 || (current_room.area_ < 10.0 && stayed_in_room_counter_ > 20)) {
           ask_vlm_finish_room_ = true;
           // if (current_room_id_ <= representation_->GetRoomNodeCount())
           if (representation_->HasRoomNode(current_room_id_)) {
@@ -3696,11 +4565,16 @@ void SensorCoveragePlanner3D::execute() {
     }
 
     exploration_path_ = ConcatenateGlobalLocalPath(global_path, local_path);
-    GetToRoomState(at_room_, near_room_1_, near_room_2_);
+    if (!potential_target_active) {
+      GetToRoomState(at_room_, near_room_1_, near_room_2_);
+    }
 
     PublishExplorationState();
 
-    lookahead_point_update_ = GetLookAheadPoint(exploration_path_, global_path, lookahead_point_);
+    if (!potential_target_active) {
+      lookahead_point_update_ =
+          GetLookAheadPoint(exploration_path_, global_path, lookahead_point_);
+    }
     PublishWaypoint();
 
     overall_processing_timer.Stop(false);
@@ -4479,7 +5353,11 @@ void SensorCoveragePlanner3D::CheckObjectFound()
                                                      std::pow(robot_position_.y - found_object_position_.y, 2) +
                                                      std::pow(robot_position_.z - found_object_position_.z, 2));
     RCLCPP_INFO(this->get_logger(), "Distance to the found object: %.2f meters", found_object_distance_);
-    if (found_object_distance_ < 1.0 && euclidean_distance_to_object_ < 2.0)
+    const bool was_within_arrival_range = ask_found_object_;
+    if (potential_target_terminal_confirmed_ ||
+        (found_object_distance_ < kFoundObjectPathDistanceThreshold &&
+         euclidean_distance_to_object_ <
+             kFoundObjectEuclideanDistanceThreshold))
     {
       ask_found_object_ = true;
     }
@@ -4488,7 +5366,25 @@ void SensorCoveragePlanner3D::CheckObjectFound()
       ask_found_object_ = false;
     }
 
-    if (current_room_id_ == found_object_room_id_)
+    if (ask_found_object_)
+    {
+      // Cancel target-routing state as soon as the final arrival gate is met.
+      // PublishWaypoint() will keep commanding the current pose.
+      grid_world_->SetObjectFound(false);
+      local_coverage_planner_->SetObjectFound(false);
+      if (!was_within_arrival_range)
+      {
+        reset_waypoint_ = true;
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Target object %d entered arrival range: path %.2f m < %.2f m "
+            "and Euclidean %.2f m < %.2f m",
+            found_object_id_, found_object_distance_,
+            kFoundObjectPathDistanceThreshold, euclidean_distance_to_object_,
+            kFoundObjectEuclideanDistanceThreshold);
+      }
+    }
+    else if (current_room_id_ == found_object_room_id_)
     {
       SetFoundTargetObject();
     }
@@ -4502,8 +5398,20 @@ void SensorCoveragePlanner3D::CheckObjectFound()
     auto &object_node = id_object_node_pair.second;
     if (object_node.label_ == target_object_)
     {
+      if (id == potential_target_approach_object_id_ &&
+          potential_target_observation_state_ ==
+              PotentialTargetObservationState::APPROACHING)
+      {
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "Target object %d passed category review; delaying final VLM "
+            "confirmation until the observation point is reached",
+            id);
+        continue;
+      }
       // if (considered_object_ids_.find(id) != considered_object_ids_.end())
-      if (object_node.IsConsidered() || object_node.IsConsideredStrong())
+      if (considered_object_ids_.find(id) != considered_object_ids_.end() ||
+          object_node.IsConsidered() || object_node.IsConsideredStrong())
       {
         RCLCPP_INFO(this->get_logger(), "❌❌❌Object %s with id %d already considered, skip", object_node.label_.c_str(), id);
         continue;
@@ -4531,6 +5439,30 @@ void SensorCoveragePlanner3D::CheckObjectFound()
       }
       auto &room_node = representation_->GetRoomNode(room_id);
       std::string label = room_node.GetRoomLabel();
+      const std::string required_room = NormalizeRoomName(room_condition_);
+      const std::string observed_room = NormalizeRoomName(label);
+      if (!required_room.empty() && observed_room.empty())
+      {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "Object %s with id %d requires room '%s', but room %d is not "
+            "labeled yet; delaying final target review",
+            object_node.label_.c_str(), object_node.object_id_[0],
+            required_room.c_str(), room_id);
+        continue;
+      }
+      if (!required_room.empty() && observed_room != required_room)
+      {
+        RCLCPP_WARN(this->get_logger(),
+                    "Rejecting object %s with id %d before final target "
+                    "review: required room '%s', observed room '%s'",
+                    object_node.label_.c_str(), object_node.object_id_[0],
+                    required_room.c_str(), observed_room.c_str());
+        object_node.SetIsConsidered(true);
+        object_node.SetIsConsideredStrong(true);
+        considered_object_ids_.insert(id);
+        continue;
+      }
       
       RCLCPP_ERROR(this->get_logger(), "❌❌❌Object %s with id %d in room %s with is_considered_ %d, is_asked_vlm_ %d, visible_viewpoint_indices_ size %d",
               object_node.label_.c_str(), object_node.object_id_[0], label.c_str(), object_node.IsConsidered(), object_node.is_asked_vlm_, (int)object_node.visible_viewpoint_indices_.size());

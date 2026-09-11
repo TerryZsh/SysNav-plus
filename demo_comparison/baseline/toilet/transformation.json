@@ -1,0 +1,22 @@
+{
+  "format": "refined-dashboard-v1",
+  "transformation": "offline re-layout from flattened baseline video and objnav.jsonl",
+  "source_video": "recordings/toilet_original_repo_demo/demo.mp4",
+  "source_events": "recordings/toilet_original_repo_demo/objnav.jsonl",
+  "source_resolution": [
+    1920,
+    1080
+  ],
+  "source_fps": 15.0,
+  "output_resolution": [
+    2560,
+    1440
+  ],
+  "output_fps": 10.0,
+  "output_frames": 2250,
+  "panorama_available": true,
+  "rviz_available": true,
+  "unity_available": true,
+  "telemetry_reconstructed_from_log": true,
+  "missing_data_inferred": false
+}

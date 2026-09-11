@@ -1,0 +1,50 @@
+{
+  "target_object": "bed",
+  "fixed_start": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.75,
+    "yaw": 0.0
+  },
+  "observed_initial_pose": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.75,
+    "qx": 0.0,
+    "qy": 0.0,
+    "qz": 0.0,
+    "qw": 1.0
+  },
+  "start_xy_error_m": 0.0,
+  "ground_truth_target_pose": {
+    "x": 8.0315,
+    "y": -8.686,
+    "z": 0.6530461,
+    "qx": 0.0,
+    "qy": 0.0,
+    "qz": 0.0,
+    "qw": 1.0
+  },
+  "initial_target_visible": true,
+  "passed": false,
+  "semantic_frames": [
+    {
+      "frame_timestamp": 1789122803.2599354,
+      "target_pixels": [
+        2
+      ]
+    },
+    {
+      "frame_timestamp": 1789122803.4999626,
+      "target_pixels": [
+        2
+      ]
+    },
+    {
+      "frame_timestamp": 1789122804.6849089,
+      "target_pixels": [
+        2
+      ]
+    }
+  ]
+}

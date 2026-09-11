@@ -27,9 +27,18 @@ from collections import deque
 import threading
 import re
 import yaml
-from rclpy.time import Time
 from vlm_node.utils import project_bbox3d
 import yaml
+
+
+class VLMRequestFailure(RuntimeError):
+    """Preserve retry metadata when a bounded target request fails."""
+
+    def __init__(self, error, retry_count):
+        super().__init__(str(error))
+        self.retry_count = retry_count
+        self.timed_out = 'timeout' in str(error).lower()
+        self.rate_limited = 'rate' in str(error).lower()
 
 
 class VLMNode(Node):
@@ -39,9 +48,24 @@ class VLMNode(Node):
         # Initialize VLM
         self.declare_parameter('log_dir', 'logs/episode_0')
         self.declare_parameter('platform', 'mecanum')
+        self.declare_parameter('max_concurrent_requests', 2)
+        self.declare_parameter('target_request_timeout_s', 12.0)
+        self.declare_parameter('target_request_max_retries', 1)
 
         self.log_dir = self.get_parameter('log_dir').get_parameter_value().string_value
         self.platform = self.get_parameter('platform').get_parameter_value().string_value
+        self.max_concurrent_requests = max(
+            1,
+            self.get_parameter('max_concurrent_requests').get_parameter_value().integer_value,
+        )
+        self.target_request_timeout_s = max(
+            1.0,
+            self.get_parameter('target_request_timeout_s').value,
+        )
+        self.target_request_max_retries = max(
+            0,
+            self.get_parameter('target_request_max_retries').get_parameter_value().integer_value,
+        )
 
         self.get_logger().info(f"Log directory: {self.log_dir}")
 
@@ -61,7 +85,6 @@ class VLMNode(Node):
         
         # queues
         self.room_type_query_queue = deque()
-        self.room_type_queries_in_flight = set()
         self.room_navigation_query_queue = deque(maxlen=1)  # only keep the latest query
         self.room_early_stop_1_query_queue = deque()
         self.object_type_query_queue = deque()
@@ -69,10 +92,23 @@ class VLMNode(Node):
         self.target_object_query_queue = deque()
         self.target_object_spatial_query_queue = deque()
         self.anchor_object_query_queue = deque()
-        self.target_object_counter = 0
-        self.target_object_spatial_counter = 0
-        self.anchor_object_counter = 0
         self.objnav_queue_times = {}
+        # A queue entry is only a staging record.  Keep a separate state for
+        # requests whose API call has already started so repeated ROS messages
+        # cannot launch duplicate requests for the same memory object.
+        self.vlm_queries_in_flight = set()
+        self.vlm_queries_suppressed = set()
+        self.vlm_queries_completed = set()
+        self.target_confirmed = False
+        self.vlm_queries_in_flight_lock = threading.Lock()
+        self.vlm_request_slots = threading.BoundedSemaphore(
+            value=self.max_concurrent_requests
+        )
+        # Leave one global request slot available for navigation-critical work
+        # instead of letting long room-reasoning calls occupy every slot.
+        self.vlm_low_priority_slots = threading.BoundedSemaphore(
+            value=max(1, self.max_concurrent_requests - 1)
+        )
 
         # Simulation room types
         self.room_types = ["Living Room", "Bedroom", "Kitchen", "Bathroom", "Balcony", "Garden"]
@@ -350,6 +386,11 @@ class VLMNode(Node):
         self.room_early_stop_1_query_queue.append(msg)
     
     def object_type_query_callback(self, msg: ObjectType):
+        if self.query_is_blocked('object_type', msg.object_id):
+            self.get_logger().debug(
+                f"Dropping duplicate or suppressed object type query for {msg.object_id}"
+            )
+            return
         self.objnav_queue_times[('object_type', int(msg.object_id))] = (
             self.get_clock().now().nanoseconds / 1e9,
             time.monotonic_ns(),
@@ -357,9 +398,18 @@ class VLMNode(Node):
         self.object_type_query_queue.append(msg)
     
     def instruction_callback(self, msg: String):
+        with self.vlm_queries_in_flight_lock:
+            self.vlm_queries_suppressed.clear()
+            self.vlm_queries_completed.clear()
+            self.target_confirmed = False
         self.instruction_queue.append(msg.data)
     
     def target_object_query_callback(self, msg: TargetObject):
+        if self.query_is_blocked('target_confirmation', msg.object_id):
+            self.get_logger().debug(
+                f"Dropping duplicate or suppressed target query for {msg.object_id}"
+            )
+            return
         self.objnav_queue_times[('target_confirmation', int(msg.object_id))] = (
             self.get_clock().now().nanoseconds / 1e9,
             time.monotonic_ns(),
@@ -367,10 +417,132 @@ class VLMNode(Node):
         self.target_object_query_queue.append(msg)
 
     def target_object_spatial_query_callback(self, msg: TargetObjectWithSpatial):
+        if self.query_is_blocked('target_spatial', msg.object_id):
+            self.get_logger().debug(
+                f"Dropping duplicate in-flight spatial target query for {msg.object_id}"
+            )
+            return
         self.target_object_spatial_query_queue.append(msg)
     
     def anchor_object_query_callback(self, msg: TargetObject):
+        if self.query_is_blocked('anchor_confirmation', msg.object_id):
+            self.get_logger().debug(
+                f"Dropping duplicate in-flight anchor query for {msg.object_id}"
+            )
+            return
         self.anchor_object_query_queue.append(msg)
+
+    def query_is_blocked(self, request_kind, object_id):
+        key = (request_kind, int(object_id))
+        with self.vlm_queries_in_flight_lock:
+            return ((self.target_confirmed and request_kind in {
+                        'object_type', 'target_confirmation',
+                        'target_spatial', 'anchor_confirmation'}) or
+                    key in self.vlm_queries_in_flight or
+                    key in self.vlm_queries_suppressed or
+                    key in self.vlm_queries_completed)
+
+    def suppress_query(self, request_kind, object_id):
+        with self.vlm_queries_in_flight_lock:
+            self.vlm_queries_suppressed.add((request_kind, int(object_id)))
+
+    def start_guarded_query(self, request_kind, object_id, callback, msg):
+        """Start a deduplicated API worker when a global request slot is free.
+
+        True means started, False means the same logical request is already in
+        flight, and None means all API slots are busy so the caller must requeue.
+        """
+        key = (request_kind, object_id)
+        low_priority = request_kind in {
+            'room_navigation', 'room_early_stop', 'room_type'
+        }
+        low_priority_slot_acquired = False
+        with self.vlm_queries_in_flight_lock:
+            if ((self.target_confirmed and request_kind in {
+                        'object_type', 'target_confirmation',
+                        'target_spatial', 'anchor_confirmation'}) or
+                    key in self.vlm_queries_in_flight or
+                    key in self.vlm_queries_suppressed or
+                    key in self.vlm_queries_completed):
+                return False
+            if (low_priority and
+                    not self.vlm_low_priority_slots.acquire(blocking=False)):
+                return None
+            low_priority_slot_acquired = low_priority
+            if not self.vlm_request_slots.acquire(blocking=False):
+                if low_priority_slot_acquired:
+                    self.vlm_low_priority_slots.release()
+                return None
+            self.vlm_queries_in_flight.add(key)
+
+        try:
+            threading.Thread(
+                target=self.process_query_guarded,
+                args=(key, callback, msg, low_priority_slot_acquired),
+                daemon=True,
+            ).start()
+        except Exception:
+            with self.vlm_queries_in_flight_lock:
+                self.vlm_queries_in_flight.discard(key)
+                self.vlm_request_slots.release()
+                if low_priority_slot_acquired:
+                    self.vlm_low_priority_slots.release()
+            raise
+        return True
+
+    def process_query_guarded(
+            self, key, callback, msg, low_priority_slot_acquired=False):
+        try:
+            callback(msg)
+        finally:
+            with self.vlm_queries_in_flight_lock:
+                self.vlm_queries_in_flight.discard(key)
+                if key[0] in {
+                        'object_type', 'target_confirmation',
+                        'target_spatial', 'anchor_confirmation'}:
+                    self.vlm_queries_completed.add(key)
+                self.vlm_request_slots.release()
+                if low_priority_slot_acquired:
+                    self.vlm_low_priority_slots.release()
+
+    def dispatch_latest_queries(self, query_queue, request_kind, callback, key_func):
+        """Coalesce a queue by logical key and start as many requests as allowed."""
+        latest_queries = {}
+        while query_queue:
+            item = query_queue.pop()
+            key = key_func(item)
+            latest_queries.setdefault(key, item)
+
+        for key, query in latest_queries.items():
+            started = self.start_guarded_query(
+                request_kind, key, callback, query
+            )
+            if started is None:
+                # A higher-priority request consumed the available slot. Keep
+                # this newest message for the next dispatcher tick.
+                query_queue.append(query)
+            elif started:
+                self.get_logger().info(
+                    f"Dispatching {request_kind} VLM query for {key}"
+                )
+
+    def call_target_vlm_with_retry(self, request_kind, object_id, request):
+        """Run a target-related API call with an explicit timeout and retry cap."""
+        for attempt in range(self.target_request_max_retries + 1):
+            try:
+                client = self.vlm_model.with_options(
+                    timeout=self.target_request_timeout_s,
+                    max_retries=0,
+                )
+                return request(client), attempt
+            except Exception as error:
+                if attempt >= self.target_request_max_retries:
+                    raise VLMRequestFailure(error, attempt) from error
+                self.get_logger().warning(
+                    f"{request_kind} VLM request for {object_id} failed "
+                    f"(attempt {attempt + 1}/"
+                    f"{self.target_request_max_retries + 1}); retrying: {error}"
+                )
 
     def objnav_trace(self, event, **fields):
         fields.update({
@@ -492,13 +664,6 @@ class VLMNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error processing room type query: {e}")
 
-    def process_room_type_query_guarded(self, room_id, msg):
-        """Keep at most one room-classification API request in flight per room."""
-        try:
-            self.process_room_type_query(msg)
-        finally:
-            self.room_type_queries_in_flight.discard(room_id)
-    
     def process_room_navigation_query(self, msg: NavigationQuery):
         """Handle room navigation query(receive a JSON string) and publish answer"""
         dumper_string = msg.json
@@ -775,20 +940,24 @@ class VLMNode(Node):
                 image_size_bytes=int(img_jpg.nbytes),
                 model=self.object_type_vlm_model,
             )
-            completion = self.vlm_model.beta.chat.completions.parse(
-                model=self.object_type_vlm_model,
-                messages=[{
-                    "role": "system",
-                    "content": self.object_type_query_prompt
-                }, {
-                    "role":
-                        "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}},
-                        {"type": "text", "text": f"Possible labels: {', '.join(self.object_list)}"},
-                    ]
-                }],
-                response_format=Result,
+            completion, retry_count = self.call_target_vlm_with_retry(
+                'object_type',
+                int(msg.object_id),
+                lambda client: client.beta.chat.completions.parse(
+                    model=self.object_type_vlm_model,
+                    messages=[{
+                        "role": "system",
+                        "content": self.object_type_query_prompt
+                    }, {
+                        "role":
+                            "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}},
+                            {"type": "text", "text": f"Possible labels: {', '.join(self.object_list)}"},
+                        ]
+                    }],
+                    response_format=Result,
+                ),
             )
             answer = completion.choices[0].message.parsed
             received_timestamp = self.get_clock().now().nanoseconds / 1e9
@@ -822,7 +991,7 @@ class VLMNode(Node):
                 api_latency_s=(received_steady - submitted_steady) / 1e9,
                 parse_latency_s=None,
                 http_status=200,
-                retry_count=0,
+                retry_count=retry_count,
                 timeout=False,
                 rate_limited=False,
                 model=self.object_type_vlm_model,
@@ -842,6 +1011,8 @@ class VLMNode(Node):
                 
         except Exception as e:
             self.get_logger().error(f"Error processing target object query: {e}")
+            if isinstance(e, VLMRequestFailure):
+                self.suppress_query('object_type', msg.object_id)
             self.objnav_trace(
                 'vlm_result',
                 request_kind='object_type',
@@ -856,9 +1027,9 @@ class VLMNode(Node):
                     'reason': 'request_failed',
                 },
                 http_status=None,
-                retry_count=0,
-                timeout='timeout' in str(e).lower(),
-                rate_limited='rate' in str(e).lower(),
+                retry_count=getattr(e, 'retry_count', 0),
+                timeout=getattr(e, 'timed_out', 'timeout' in str(e).lower()),
+                rate_limited=getattr(e, 'rate_limited', 'rate' in str(e).lower()),
                 model=self.object_type_vlm_model,
                 error=str(e),
             )
@@ -966,10 +1137,18 @@ class VLMNode(Node):
 
         object_label = msg.object_label
         room_label = msg.room_label
+        object_position = msg.object_position
         if room_label == "":
-            description = f"This is a {object_label}. {{ 'Obejct Type': {object_label}, 'Room Type': Unknown }}, Here is its image."
-        else:        
-            description = f"This is a {object_label} in the {room_label}. {{ 'Obejct Type': {object_label}, 'Room Type': {room_label} }}, Here is its image."
+            room_label = "unknown"
+        description = (
+            f"Candidate label: {object_label}. Memory room label: {room_label}. "
+            f"3D map position: ({object_position.x:.2f}, "
+            f"{object_position.y:.2f}, {object_position.z:.2f}). "
+            "The memory room label is weak, potentially stale context. Never "
+            "reject a candidate only because that label conflicts with the "
+            "instruction. If visible room cues support the requested room, "
+            "trust the image over the memory room label."
+        )
 
         instruction = f"Instruction: {self.instruction}, {{ 'Target Object': {self.target_object}, 'Room Condition': {self.room_condition if self.room_condition else 'None'}, 'Attribute Condition': {self.attribute_condition if self.attribute_condition else 'None'} }} \n Determine whether the following object matches the target object described in the instruction."
 
@@ -994,6 +1173,11 @@ class VLMNode(Node):
                     },
                     'candidate_labels': [object_label],
                     'room_context': room_label,
+                    'object_position': {
+                        'x': object_position.x,
+                        'y': object_position.y,
+                        'z': object_position.z,
+                    },
                     'image_path': msg.img_path,
                 },
                 queue_wait_s=(started_steady - queued_steady) / 1e9,
@@ -1001,21 +1185,25 @@ class VLMNode(Node):
                 image_size_bytes=int(img_jpg.nbytes),
                 model=self.object_type_vlm_model,
             )
-            completion = self.vlm_model.beta.chat.completions.parse(
-                model=self.object_type_vlm_model,
-                messages=[{
-                    "role": "system",
-                    "content": self.target_object_prompt
-                }, {
-                    "role":
-                        "user",
-                    "content": [
-                        {"type": "text", "text": instruction},
-                        {"type": "text", "text": description},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}},
-                    ]
-                }],
-                response_format=Result,
+            completion, retry_count = self.call_target_vlm_with_retry(
+                'target_confirmation',
+                int(msg.object_id),
+                lambda client: client.beta.chat.completions.parse(
+                    model=self.object_type_vlm_model,
+                    messages=[{
+                        "role": "system",
+                        "content": self.target_object_prompt
+                    }, {
+                        "role":
+                            "user",
+                        "content": [
+                            {"type": "text", "text": instruction},
+                            {"type": "text", "text": description},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}},
+                        ]
+                    }],
+                    response_format=Result,
+                ),
             )
             answer = completion.choices[0].message.parsed
             received_timestamp = self.get_clock().now().nanoseconds / 1e9
@@ -1023,6 +1211,7 @@ class VLMNode(Node):
             # print the answer
             self.get_logger().info(f"Received target object answer: {answer}")
             is_target = answer.is_target
+            decision_reason = answer.reason
             self.get_logger().info(f"Is target object: {is_target}")
             # Publish the target object answer
             answer_msg = TargetObject()
@@ -1031,6 +1220,7 @@ class VLMNode(Node):
             answer_msg.img_path = msg.img_path
             answer_msg.object_label = msg.object_label
             answer_msg.room_label = msg.room_label
+            answer_msg.object_position = msg.object_position
             answer_msg.is_target = is_target
             self.target_object_answer_publisher.publish(answer_msg)
             self.get_logger().info("Published target object answer")
@@ -1045,20 +1235,20 @@ class VLMNode(Node):
                     'final_label': object_label,
                     'is_target': bool(is_target),
                     'accepted': bool(is_target),
-                    'reason': answer.reason,
+                    'reason': decision_reason,
                 },
                 queue_wait_s=(started_steady - queued_steady) / 1e9,
                 api_latency_s=(received_steady - submitted_steady) / 1e9,
                 parse_latency_s=None,
                 http_status=200,
-                retry_count=0,
+                retry_count=retry_count,
                 timeout=False,
                 rate_limited=False,
                 model=self.object_type_vlm_model,
                 image_size_bytes=int(img_jpg.nbytes),
             )
 
-            text = f"Object ID: {msg.object_id}\nObject Label: {object_label}\nRoom Label: {room_label}\nIs Target: {is_target}\nReason: {answer.reason}"
+            text = f"Object ID: {msg.object_id}\nObject Label: {object_label}\nRoom Label: {room_label}\nIs Target: {is_target}\nReason: {decision_reason}"
             self.publish_text_overlay(text)
             # save the image for debugging
             time_int = int(time.time())
@@ -1068,9 +1258,20 @@ class VLMNode(Node):
             answer_file_path = f"debug/target_object/{time_int}_{msg.object_id}_{object_label}_{is_target}.txt"
             with open(answer_file_path, 'w') as f:
                 f.write(f"Instruction: {instruction}\nDescription: {description}\n")
-                f.write(f"Is Target: {is_target}\nReason: {answer.reason}")
+                f.write(f"Is Target: {is_target}\nReason: {decision_reason}")
         except Exception as e:
             self.get_logger().error(f"Error processing target object query: {e}")
+            if isinstance(e, VLMRequestFailure):
+                self.suppress_query('target_confirmation', msg.object_id)
+            answer_msg = TargetObject()
+            answer_msg.header = msg.header
+            answer_msg.object_id = msg.object_id
+            answer_msg.img_path = msg.img_path
+            answer_msg.object_label = msg.object_label
+            answer_msg.room_label = msg.room_label
+            answer_msg.object_position = msg.object_position
+            answer_msg.is_target = False
+            self.target_object_answer_publisher.publish(answer_msg)
             self.objnav_trace(
                 'vlm_result',
                 request_kind='target_confirmation',
@@ -1085,9 +1286,9 @@ class VLMNode(Node):
                     'reason': 'request_failed',
                 },
                 http_status=None,
-                retry_count=0,
-                timeout='timeout' in str(e).lower(),
-                rate_limited='rate' in str(e).lower(),
+                retry_count=getattr(e, 'retry_count', 0),
+                timeout=getattr(e, 'timed_out', 'timeout' in str(e).lower()),
+                rate_limited=getattr(e, 'rate_limited', 'rate' in str(e).lower()),
                 model=self.object_type_vlm_model,
                 error=str(e),
             )
@@ -1183,6 +1384,9 @@ class VLMNode(Node):
             self.get_logger().info(f"Received target object with spatial answer: {answer}")
             is_target = answer.is_target
             self.get_logger().info(f"Is target object: {is_target}")
+            if is_target:
+                with self.vlm_queries_in_flight_lock:
+                    self.target_confirmed = True
             # Publish the target object with spatial answer
             answer_msg = TargetObject()
             answer_msg.header = msg.header
@@ -1289,101 +1493,65 @@ class VLMNode(Node):
             self.get_logger().error(f"Error processing target object query: {e}")
 
     def vlm_node_callback(self):
-        """Main loop to process queries"""
-        # check if there are any room type queries
-        if self.room_type_query_queue:
-            latest_queries = {}
-            # for each room_id, only keep the latest query
-            while self.room_type_query_queue:
-                item = self.room_type_query_queue.pop()  # 先出最新的
-                room_id = item.room_id
-                if room_id not in latest_queries or Time.from_msg(item.header.stamp) > Time.from_msg(latest_queries[room_id].header.stamp):
-                    latest_queries[room_id] = item
-            # using multithreading to process room type queries
-            for room_id, query in latest_queries.items():
-                if room_id in self.room_type_queries_in_flight:
-                    continue
-                self.room_type_queries_in_flight.add(room_id)
-                self.get_logger().info(f"Processing room type query for room {room_id}")
-                threading.Thread(
-                    target=self.process_room_type_query_guarded,
-                    args=(room_id, query),
-                    daemon=True,
-                ).start()
-        
-        # check if there are any room early stop 1 queries
-        if self.room_early_stop_1_query_queue:
-            while self.room_early_stop_1_query_queue:
-                item = self.room_early_stop_1_query_queue.popleft()
-                self.get_logger().info(f"Processing room early stop 1 query for rooms {item.room_id_1} and {item.room_id_2}")
-                threading.Thread(target=self.process_room_early_stop_1_query, args=(item,)).start()
+        """Dispatch API work in navigation-critical priority order.
 
-        # check if there are any room navigation queries
-        if self.room_navigation_query_queue:
-            while self.room_navigation_query_queue:
-                item = self.room_navigation_query_queue.popleft()
-                self.get_logger().info(f"Processing room navigation query: {item.json}")
-                threading.Thread(target=self.process_room_navigation_query, args=(item,)).start()
-        
-        # check if there are any target object queries
-        if self.object_type_query_queue:
-            while self.object_type_query_queue:
-                item = self.object_type_query_queue.popleft()
-                self.get_logger().info(f"Processing target object query for object ID: {item.object_id}")
-                threading.Thread(target=self.process_object_type_query, args=(item,)).start()
-    
-        # check if there are any new instructions
-        if self.instruction_queue:
-            while self.instruction_queue:
-                instruction = self.instruction_queue.popleft()
-                self.get_logger().info(f"Processing new instruction: {instruction}")
-                threading.Thread(target=self.process_instruction, args=(instruction,)).start()
-        
-        # process the target object query
-        self.target_object_counter += 1
-        # if self.target_object_counter % 10 == 0:
-        if True:
-            self.target_object_counter = 0
-            if self.target_object_query_queue:
-                latest_queries = {}
-                while self.target_object_query_queue:
-                    item = self.target_object_query_queue.pop()  # 先出最新的
-                    object_id = item.object_id
-                    if object_id not in latest_queries or Time.from_msg(item.header.stamp) > Time.from_msg(latest_queries[object_id].header.stamp):
-                        latest_queries[object_id] = item
-                for object_id, query in latest_queries.items():
-                    self.get_logger().info(f"Processing target object query for object ID: {object_id}")
-                    threading.Thread(target=self.process_target_object_query, args=(query,)).start()
+        Running calls cannot be preempted, but a target request always consumes
+        the next free global slot before waiting room-classification work.
+        """
+        # A new instruction defines every downstream target, so parse it first.
+        self.dispatch_latest_queries(
+            self.instruction_queue,
+            'instruction',
+            self.process_instruction,
+            lambda instruction: instruction,
+        )
 
-        # process the target object with spatial query
-        self.target_object_spatial_counter += 1
-        if self.target_object_spatial_counter % 10 == 0:
-            self.target_object_spatial_counter = 0
-            if self.target_object_spatial_query_queue:
-                latest_queries = {}
-                while self.target_object_spatial_query_queue:
-                    item = self.target_object_spatial_query_queue.pop()  # 先出最新的
-                    object_id = item.object_id
-                    if object_id not in latest_queries or Time.from_msg(item.header.stamp) > Time.from_msg(latest_queries[object_id].header.stamp):
-                        latest_queries[object_id] = item
-                for object_id, query in latest_queries.items():
-                    self.get_logger().info(f"Processing target object with spatial query for object ID: {object_id}")
-                    threading.Thread(target=self.process_target_object_spatial_query, args=(query,)).start()
-        
-        # process the anchor object query
-        self.anchor_object_counter += 1
-        if self.anchor_object_counter % 10 == 0:
-            self.anchor_object_counter = 0
-            if self.anchor_object_query_queue:
-                latest_queries = {}
-                while self.anchor_object_query_queue:
-                    item = self.anchor_object_query_queue.pop()  # 先出最新的
-                    object_id = item.object_id
-                    if object_id not in latest_queries or Time.from_msg(item.header.stamp) > Time.from_msg(latest_queries[object_id].header.stamp):
-                        latest_queries[object_id] = item
-                for object_id, query in latest_queries.items():
-                    self.get_logger().info(f"Processing anchor object query for object ID: {object_id}")
-                    threading.Thread(target=self.process_anchor_object_query, args=(query,)).start()
+        # Final confirmation can immediately terminate exploration.
+        self.dispatch_latest_queries(
+            self.target_object_query_queue,
+            'target_confirmation',
+            self.process_target_object_query,
+            lambda query: int(query.object_id),
+        )
+        self.dispatch_latest_queries(
+            self.target_object_spatial_query_queue,
+            'target_spatial',
+            self.process_target_object_spatial_query,
+            lambda query: int(query.object_id),
+        )
+
+        # Potential Target category review jumps ahead of all room reasoning.
+        self.dispatch_latest_queries(
+            self.object_type_query_queue,
+            'object_type',
+            self.process_object_type_query,
+            lambda query: int(query.object_id),
+        )
+        self.dispatch_latest_queries(
+            self.anchor_object_query_queue,
+            'anchor_confirmation',
+            self.process_anchor_object_query,
+            lambda query: int(query.object_id),
+        )
+
+        self.dispatch_latest_queries(
+            self.room_navigation_query_queue,
+            'room_navigation',
+            self.process_room_navigation_query,
+            lambda query: query.json,
+        )
+        self.dispatch_latest_queries(
+            self.room_early_stop_1_query_queue,
+            'room_early_stop',
+            self.process_room_early_stop_1_query,
+            lambda query: (int(query.room_id_1), int(query.room_id_2)),
+        )
+        self.dispatch_latest_queries(
+            self.room_type_query_queue,
+            'room_type',
+            self.process_room_type_query,
+            lambda query: int(query.room_id),
+        )
 
         # self.publish_text_overlay("VLM Node is running...")
     

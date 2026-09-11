@@ -858,6 +858,9 @@ class ObjMapper():
                     'object_id': single_obj.obj_id[0],
                     'labels': list(single_obj.class_id.keys()),
                     'img_path': single_obj.best_image_path,
+                    'candidate_kind': (
+                        'target' if label == self.target_object else 'anchor'
+                    ),
                 }
                 target_objects.append(single_target_obj)
         return target_objects

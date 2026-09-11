@@ -2,3 +2,8 @@ vlm_node:
   ros__parameters:
     platform: mecanum
     log_dir: logs/episode_0
+    # Reserve bounded API capacity so target-related work can jump ahead of
+    # queued room reasoning without creating unbounded concurrent requests.
+    max_concurrent_requests: 2
+    target_request_timeout_s: 12.0
+    target_request_max_retries: 1

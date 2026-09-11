@@ -1,0 +1,100 @@
+{
+  "run_name": "unified-target-bed-20260911-02",
+  "instruction": "Find a bed in the bedroom.",
+  "target_object": "bed",
+  "target_resolved_timestamp": 1789122812.5699315,
+  "success": true,
+  "stop_reason": "goal_reached",
+  "duration_s": 46.338,
+  "event_times_s": {
+    "episode_start": 0.681525,
+    "yolo_target_detected": 36.14718,
+    "semantic_projection_ready": 37.122802,
+    "object_memory_associated": 37.123252,
+    "vlm_candidate_selected": 37.125789,
+    "vlm_request_started": 38.031613,
+    "vlm_submitted": 38.034063,
+    "planner_input_sent": 41.657159,
+    "vlm_result": 41.657969,
+    "episode_end": 46.334814
+  },
+  "event_counts": {
+    "episode_start": 1,
+    "yolo_target_detected": 1,
+    "semantic_projection_ready": 12,
+    "object_memory_associated": 12,
+    "vlm_candidate_selected": 10,
+    "vlm_request_started": 1,
+    "vlm_submitted": 1,
+    "planner_input_sent": 1,
+    "vlm_result": 1,
+    "episode_end": 1
+  },
+  "topic_counts": {
+    "state_estimation": 8942,
+    "cmd_vel": 2089,
+    "semantic_image": 191,
+    "detection_result": 332,
+    "way_point": 41,
+    "global_path": 38,
+    "object_nodes_list": 137,
+    "target_instruction": 1,
+    "target_object_answer": 1
+  },
+  "travel_distance_m": 25.008,
+  "demo_recorded": true,
+  "planner_path_generated": false,
+  "panorama_recorded": true,
+  "rviz_memory_view_recorded": true,
+  "unity_third_person_recorded": true,
+  "data_panel_recorded": true,
+  "rviz_started": true,
+  "desktop_capture": false,
+  "composition_layout": {
+    "panorama": [
+      24,
+      146,
+      1816,
+      605
+    ],
+    "rviz_memory": [
+      24,
+      834,
+      1212,
+      582
+    ],
+    "unity_third_person": [
+      1864,
+      146,
+      672,
+      378
+    ],
+    "pipeline_stage": [
+      1864,
+      550,
+      672,
+      201
+    ],
+    "vlm_io_dashboard": [
+      1260,
+      834,
+      1276,
+      582
+    ],
+    "vlm_result_caption": [
+      24,
+      770,
+      2512,
+      44
+    ]
+  },
+  "vlm_submissions_observed": 2,
+  "vlm_outputs_received": 2,
+  "vlm_result_captions_shown": 2,
+  "vlm_result_captions_complete": true,
+  "memory_objects_at_end": 47,
+  "final_pipeline_stage": "GOAL REACHED",
+  "demo_failure_reason": null,
+  "navigation_success": true,
+  "post_arrival_linger_seconds": 2.0
+}

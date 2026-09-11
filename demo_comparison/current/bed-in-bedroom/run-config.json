@@ -1,0 +1,53 @@
+{
+  "instruction": "Find a bed in the bedroom.",
+  "max_seconds": 300.0,
+  "post_arrival_linger_seconds": 2.0,
+  "ros_domain_id": 91,
+  "video_source": "direct synchronized compositor: /annotated_image + RViz window stream + Unity window stream; no desktop capture",
+  "video_resolution": "2560x1440",
+  "desktop_capture": false,
+  "layout": {
+    "panorama": [
+      24,
+      146,
+      1816,
+      605
+    ],
+    "rviz_memory": [
+      24,
+      834,
+      1212,
+      582
+    ],
+    "unity_third_person": [
+      1864,
+      146,
+      672,
+      378
+    ],
+    "pipeline_stage": [
+      1864,
+      550,
+      672,
+      201
+    ],
+    "vlm_io_dashboard": [
+      1260,
+      834,
+      1276,
+      582
+    ],
+    "vlm_result_caption": [
+      24,
+      770,
+      2512,
+      44
+    ]
+  },
+  "panorama_topic": "/annotated_image",
+  "ground_truth_target_pose": [
+    8.0315,
+    -8.686,
+    0.6530461
+  ]
+}
